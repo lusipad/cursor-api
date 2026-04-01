@@ -171,7 +171,7 @@ use http::StatusCode;
 //     ) -> anthropic::AnthropicError {
 //         let message = message
 //             .as_ref()
-//             .map(|message| __unwrap!(serde_json::to_string(&message)))
+//             .map(|message| __unwrap!(sonic_rs::to_string(&message)))
 //             .unwrap_or(default);
 //         anthropic::ErrorDetail {
 //             r#type: error_type,
@@ -290,10 +290,7 @@ impl<T: ErrorTriple> ErrorExt for T {
     #[inline]
     fn into_anthropic_tuple(self) -> (StatusCode, InfallibleJson<AnthropicError>) {
         let (status, error_type, message) = self.triple();
-        (
-            status,
-            InfallibleJson(AnthropicErrorInner { r#type: error_type, message }.wrapped()),
-        )
+        (status, InfallibleJson(AnthropicErrorInner { r#type: error_type, message }.wrapped()))
     }
 }
 

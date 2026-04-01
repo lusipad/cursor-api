@@ -1,7 +1,7 @@
 use super::{
-    command::{LogCommand, LogUpdate},
+    command::{LogCommand, LogPatch},
     limit::LogsLimit,
-    storage::{AssociatedStorage, AssociatedToken, MainStorage},
+    storage::{MainStorage, TokenEntry, TokenStore},
 };
 use crate::{
     app::{
@@ -30,14 +30,14 @@ macro_rules! unwrap {
 
 pub struct LogManager {
     pub(super) logs: MainStorage,
-    pub(super) tokens: AssociatedStorage,
+    pub(super) tokens: TokenStore,
 }
 
 impl LogManager {
     fn new() -> Self {
         Self {
             logs: MainStorage::new(),
-            tokens: AssociatedStorage::with_hasher(ahash::RandomState::new()),
+            tokens: TokenStore::with_hasher(ahash::RandomState::new()),
         }
     }
 
@@ -320,7 +320,7 @@ fn handle_command(mgr: &mut LogManager, cmd: LogCommand) -> bool {
                     a.ref_count += 1;
                 }
                 Entry::Vacant(e) => {
-                    e.insert(AssociatedToken { token, ref_count: 1 });
+                    e.insert(TokenEntry { token, ref_count: 1 });
                 }
             }
         }
@@ -342,31 +342,31 @@ fn handle_command(mgr: &mut LogManager, cmd: LogCommand) -> bool {
         LogCommand::CloneToSave { tx } => {
             unwrap!(tx.send((mgr as &LogManager).into()))
         }
-        LogCommand::UpdateLog { id, ops } => {
+        LogCommand::UpdateLog { id, patch } => {
             if let Some(log) = mgr.logs.iter_mut().rev().find(|log| log.id == id) {
-                match ops {
-                    LogUpdate::TokenProfile(user, usage, stripe) => {
+                match patch {
+                    LogPatch::TokenProfile(user, usage, stripe) => {
                         log.token_info.user = user;
                         log.token_info.usage = usage;
                         log.token_info.stripe = stripe;
                     }
-                    LogUpdate::Failure(error) => {
+                    LogPatch::Failure(error) => {
                         log.status = LogStatus::Failure;
                         log.error = error;
                     }
-                    LogUpdate::Success => log.status = LogStatus::Success,
-                    LogUpdate::Timing(t) => log.timing.total = format_time_ms(t),
-                    LogUpdate::Failure2(error, t) => {
+                    LogPatch::Success => log.status = LogStatus::Success,
+                    LogPatch::Timing(t) => log.timing.total = format_time_ms(t),
+                    LogPatch::FailureTimed(error, t) => {
                         log.status = LogStatus::Failure;
                         log.error = error;
                         log.timing.total = format_time_ms(t);
                     }
-                    LogUpdate::Delays(delays, think) => {
+                    LogPatch::Delays(delays, think) => {
                         log.chain.delays = delays;
                         log.chain.think = think;
                     }
-                    LogUpdate::Usage(usage) => log.chain.usage = Some(usage),
-                    LogUpdate::TimingChain(t, chain) => {
+                    LogPatch::Usage(usage) => log.chain.usage = Some(usage),
+                    LogPatch::TimingChain(t, chain) => {
                         log.timing.total = format_time_ms(t);
                         log.chain = chain;
                     }
@@ -396,7 +396,7 @@ impl<T> Expect for Result<T, tokio::sync::oneshot::error::RecvError> {
 
 fn expect<R: Expect>(r: R) -> R::T { r.expect() }
 
-pub async fn get_logs(params: super::GetLogsParams) -> (u64, Vec<RequestLog>) {
+pub async fn get_logs(params: super::LogQuery) -> (u64, Vec<RequestLog>) {
     let (tx, rx) = oneshot::channel();
     expect(LOG_COMMAND_SENDER.send(LogCommand::GetLogs { params, tx }).await);
     expect(rx.await)
@@ -430,8 +430,8 @@ async fn clone_to_save() -> super::LogManagerHelper {
     expect(rx.await)
 }
 
-pub async fn update_log(id: u64, ops: LogUpdate) {
-    expect(LOG_COMMAND_SENDER.send(LogCommand::UpdateLog { id, ops }).await)
+pub async fn update_log(id: u64, patch: LogPatch) {
+    expect(LOG_COMMAND_SENDER.send(LogCommand::UpdateLog { id, patch }).await)
 }
 
 pub fn is_enabled() -> bool { REQUEST_LOGS_LIMIT.should_log() }

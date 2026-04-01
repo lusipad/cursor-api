@@ -28,9 +28,7 @@
 //!     .language(Language::English));
 //! ```
 
-use core::fmt;
-use core::time::Duration;
-
+use core::{fmt, time::Duration};
 use rand::RngExt as _;
 
 /// Defines the display format for duration formatting.
@@ -953,9 +951,8 @@ pub const fn human(duration: Duration) -> HumanDuration { HumanDuration::new(dur
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_compact_format() {

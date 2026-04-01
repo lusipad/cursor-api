@@ -1,8 +1,9 @@
 use byte_str::ByteStr;
 use bytes::Bytes;
-use core::mem::transmute;
-use serde::{Serialize, Serializer};
-use serde_json::value::RawValue;
+use serde::{Serialize, Serializer, ser::SerializeStruct as _};
+
+#[cfg(not(feature = "__perf"))]
+use serde_json as sonic_rs;
 
 #[repr(transparent)]
 pub struct RawJson(ByteStr);
@@ -32,19 +33,36 @@ impl Serialize for RawJson {
     }
 }
 
-pub fn to_raw_json<T>(value: &T) -> Result<RawJson, serde_json::Error>
+pub fn to_raw_json<T>(value: &T) -> Result<RawJson, sonic_rs::Error>
 where T: ?Sized + Serialize {
-    let json = match serde_json::to_string(value) {
+    let json = match sonic_rs::to_string(value) {
         Ok(s) => s.into(),
         Err(e) => return Err(e),
     };
     Ok(RawJson(json))
 }
 
+#[cfg(feature = "__perf")]
+const TOKEN: &str = "$sonic_rs::LazyValue";
+#[cfg(not(feature = "__perf"))]
+const TOKEN: &str = "$serde_json::private::RawValue";
+
 #[inline(always)]
 pub fn serialize_as_raw_value<S>(src: &str, serializer: S) -> Result<S::Ok, S::Error>
 where S: Serializer {
-    unsafe { transmute::<&str, &RawValue>(src) }.serialize(serializer)
+    let mut s = match serializer.serialize_struct(TOKEN, 1) {
+        Ok(val) => val,
+        Err(err) => {
+            return Err(err);
+        }
+    };
+    match s.serialize_field(TOKEN, src) {
+        Ok(val) => val,
+        Err(err) => {
+            return Err(err);
+        }
+    };
+    s.end()
 }
 
 #[inline(always)]

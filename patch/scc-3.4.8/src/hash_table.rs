@@ -14,12 +14,12 @@ use bucket::{BUCKET_LEN, CACHE, EntryPtr, INDEX, LruList, Reader, Writer};
 use bucket_array::BucketArray;
 #[cfg(feature = "loom")]
 use loom::sync::atomic::AtomicUsize;
-use sdd::{AtomicShared, Ptr, Shared, Tag};
+use sdd::{AtomicRaw, Owned, RawPtr};
 
 use super::data_block::DataBlock;
 use super::exit_guard::ExitGuard;
 use super::hash_table::bucket::Bucket;
-use super::utils::{AsyncGuard, unwrap_unchecked};
+use super::utils::{AsyncGuard, deref_unchecked, get_owned, unwrap_unchecked};
 use super::{Equivalent, Guard};
 
 /// `HashTable` defines common functions for hash table implementations.
@@ -41,7 +41,7 @@ where
     fn hasher(&self) -> &H;
 
     /// Returns a reference to the [`BucketArray`] pointer.
-    fn bucket_array_var(&self) -> &AtomicShared<BucketArray<K, V, L, TYPE>>;
+    fn bucket_array_var(&self) -> &AtomicRaw<BucketArray<K, V, L, TYPE>>;
 
     /// Returns a reference to the current [`BucketArray`].
     #[inline]
@@ -49,13 +49,14 @@ where
         unsafe {
             self.bucket_array_var()
                 .load(Acquire, guard)
+                .into_ptr()
                 .as_ref_unchecked()
         }
     }
 
     /// Passes the bucket array to the garbage collector associated with the hash table type.
     #[inline]
-    fn defer_reclaim(&self, bucket_array: Shared<BucketArray<K, V, L, TYPE>>, _guard: &Guard) {
+    fn defer_reclaim(&self, bucket_array: Owned<BucketArray<K, V, L, TYPE>>, _guard: &Guard) {
         drop(bucket_array);
     }
 
@@ -65,6 +66,7 @@ where
         unsafe {
             self.bucket_array_var()
                 .load(Acquire, &Guard::new())
+                .into_ptr()
                 .as_ref_unchecked()
                 .map_or(0, |a| a.bucket_index(hash))
         }
@@ -108,7 +110,7 @@ where
                 Ok(_) => {
                     let guard = Guard::new();
                     if let Some(current_array) = self.bucket_array(&guard) {
-                        if !current_array.has_linked_array() {
+                        if !current_array.has_linked_array(&guard) {
                             self.try_resize(current_array, &guard);
                         }
                     }
@@ -135,16 +137,21 @@ where
     fn allocate_bucket_array<'g>(&self, guard: &'g Guard) -> &'g BucketArray<K, V, L, TYPE> {
         unsafe {
             let capacity = self.minimum_capacity();
-            let allocated =
-                Shared::new_with_unchecked(|| BucketArray::new(capacity, AtomicShared::null()));
+            let new_bucket_array =
+                Owned::new_with_unchecked(|| BucketArray::new(capacity, AtomicRaw::null()));
+            let new_bucket_array_ptr = new_bucket_array.into_raw();
             match self.bucket_array_var().compare_exchange(
-                Ptr::null(),
-                (Some(allocated), Tag::None),
+                RawPtr::null(),
+                new_bucket_array_ptr,
                 AcqRel,
                 Acquire,
                 guard,
             ) {
-                Ok((_, ptr)) | Err((_, ptr)) => ptr.as_ref_unchecked().unwrap_unchecked(),
+                Ok(_) => unwrap_unchecked(deref_unchecked(new_bucket_array_ptr)),
+                Err(ptr) => {
+                    drop(get_owned(new_bucket_array_ptr));
+                    unwrap_unchecked(deref_unchecked(ptr))
+                }
             }
         }
     }
@@ -228,7 +235,7 @@ where
 
         let hash = self.hash(key);
         let mut current_array_ptr = self.bucket_array_var().load(Acquire, guard);
-        while let Some(current_array) = unsafe { current_array_ptr.as_ref_unchecked() } {
+        while let Some(current_array) = deref_unchecked(current_array_ptr) {
             if let Some(old_array) = current_array.linked_array(guard) {
                 self.incremental_rehash_sync::<true>(current_array, guard);
                 let index = old_array.bucket_index(hash);
@@ -270,7 +277,7 @@ where
         let async_guard = AsyncGuard::default();
         while let Some(current_array) = async_guard.load_unchecked(self.bucket_array_var(), Acquire)
         {
-            if current_array.has_linked_array() {
+            if current_array.has_linked_array(async_guard.guard()) {
                 self.incremental_rehash_async(current_array, &async_guard)
                     .await;
                 if !self
@@ -338,7 +345,7 @@ where
         }
         loop {
             let current_array = self.get_or_create_bucket_array(async_guard.guard());
-            if current_array.has_linked_array() {
+            if current_array.has_linked_array(async_guard.guard()) {
                 self.incremental_rehash_async(current_array, &async_guard)
                     .await;
                 if !self
@@ -416,7 +423,7 @@ where
         }
         while let Some(current_array) = async_guard.load_unchecked(self.bucket_array_var(), Acquire)
         {
-            if current_array.has_linked_array() {
+            if current_array.has_linked_array(async_guard.guard()) {
                 self.incremental_rehash_async(current_array, &async_guard)
                     .await;
                 if !self
@@ -479,7 +486,7 @@ where
         guard: &Guard,
     ) -> Option<LockedBucket<K, V, L, TYPE>> {
         if let Some(current_array) = self.bucket_array(guard) {
-            if current_array.has_linked_array() {
+            if current_array.has_linked_array(guard) {
                 return None;
             }
             let bucket_index = current_array.bucket_index(hash);
@@ -522,7 +529,7 @@ where
             prev_len = current_array.len();
 
             while start_index < current_array.len() {
-                if current_array.has_linked_array() {
+                if current_array.has_linked_array(async_guard.guard()) {
                     self.incremental_rehash_async(current_array, &async_guard)
                         .await;
                     if !self
@@ -634,7 +641,7 @@ where
 
             while start_index < current_array_len {
                 let bucket_index = start_index;
-                if current_array.has_linked_array() {
+                if current_array.has_linked_array(async_guard.guard()) {
                     self.incremental_rehash_async(current_array, &async_guard)
                         .await;
                     if !self
@@ -836,7 +843,7 @@ where
                 }
 
                 // The old bucket array was removed, no point in trying to move entries from it.
-                if !current_array.has_linked_array() {
+                if !current_array.has_linked_array(async_guard.guard()) {
                     break;
                 }
             }
@@ -1177,15 +1184,15 @@ where
                         )
                         .await;
                     }
-                    debug_assert!(current_array.has_linked_array());
+                    debug_assert!(current_array.has_linked_array(async_guard.guard()));
                 }
 
                 if Self::end_incremental_rehash(rehashing_guard.0, rehashing_guard.1, true) {
-                    if let Some(bucket_array) = current_array
-                        .linked_array_var()
-                        .swap((None, Tag::None), Release)
-                        .0
-                    {
+                    if let Some(bucket_array) = get_owned(current_array.linked_array_var().swap(
+                        RawPtr::null(),
+                        Release,
+                        async_guard.guard(),
+                    )) {
                         self.defer_reclaim(bucket_array, async_guard.guard());
                     }
                 }
@@ -1233,11 +1240,11 @@ where
                 }
 
                 if Self::end_incremental_rehash(rehashing_guard.0, rehashing_guard.1, true) {
-                    if let Some(bucket_array) = current_array
-                        .linked_array_var()
-                        .swap((None, Tag::None), Release)
-                        .0
-                    {
+                    if let Some(bucket_array) = get_owned(current_array.linked_array_var().swap(
+                        RawPtr::null(),
+                        Release,
+                        guard,
+                    )) {
                         self.defer_reclaim(bucket_array, guard);
                     }
                 }
@@ -1248,7 +1255,7 @@ where
 
     /// Tries to enlarge [`HashTable`].
     fn try_enlarge(&self, current_array: &BucketArray<K, V, L, TYPE>, index: usize, guard: &Guard) {
-        if !current_array.has_linked_array() {
+        if !current_array.has_linked_array(guard) {
             let sample_size = current_array.small_sample_size();
             let sample_capacity = sample_size * BUCKET_LEN;
             let mut num_entries = 0;
@@ -1265,7 +1272,8 @@ where
 
     /// Tries to shrink the [`HashTable`] to fit.
     fn try_shrink(&self, current_array: &BucketArray<K, V, L, TYPE>, index: usize, guard: &Guard) {
-        if !current_array.has_linked_array() && current_array.num_slots() > self.minimum_capacity()
+        if !current_array.has_linked_array(guard)
+            && current_array.num_slots() > self.minimum_capacity()
         {
             let sample_size = current_array.small_sample_size();
             let sample_capacity = sample_size * BUCKET_LEN;
@@ -1290,14 +1298,14 @@ where
     /// acquiring the resize lock with a very large sample size.
     fn try_resize(&self, sampled_array: &BucketArray<K, V, L, TYPE>, guard: &Guard) {
         let current_array_ptr = self.bucket_array_var().load(Acquire, guard);
-        let Some(current_array) = (unsafe { current_array_ptr.as_ref_unchecked() }) else {
+        let Some(current_array) = deref_unchecked(current_array_ptr) else {
             // The hash table is empty.
             return;
         };
         if !ptr::eq(current_array, sampled_array) {
             // The preliminary sampling result cannot be trusted anymore.
             return;
-        } else if current_array.has_linked_array() {
+        } else if current_array.has_linked_array(guard) {
             // Cannot resize with a bucket array linked to the current bucket array.
             return;
         } else if self.minimum_capacity_var().load(Relaxed) >= RESIZING {
@@ -1367,7 +1375,7 @@ where
                 // All the buckets are empty and locked.
                 writer_guard.1 = true;
                 if let Some(bucket_array) =
-                    self.bucket_array_var().swap((None, Tag::None), Release).0
+                    get_owned(self.bucket_array_var().swap(RawPtr::null(), Release, guard))
                 {
                     self.defer_reclaim(bucket_array, guard);
                 }
@@ -1391,15 +1399,15 @@ where
             );
             if new_capacity != capacity {
                 let new_bucket_array = unsafe {
-                    Shared::new_with_unchecked(|| {
+                    Owned::new_with_unchecked(|| {
                         BucketArray::<K, V, L, TYPE>::new(
                             new_capacity,
-                            (*self.bucket_array_var()).clone(Relaxed, guard),
+                            AtomicRaw::new(current_array_ptr),
                         )
                     })
                 };
                 self.bucket_array_var()
-                    .swap((Some(new_bucket_array), Tag::None), Release);
+                    .store(new_bucket_array.into_raw(), Release);
             }
         }
     }

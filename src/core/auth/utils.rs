@@ -41,26 +41,29 @@ pub(super) fn get_environment_info(
         headers.get(key).and_then(|v| {
             let v: &crate::common::model::HeaderValue = unsafe { core::mem::transmute(v) };
             let bytes = v.inner.as_ref();
-            for &b in bytes {
-                if !(b >= 32 && b < 127 || b == b'\t') {
-                    return None;
-                }
-            }
+            crate::common::model::HeaderValue::validate(bytes).ok()?;
             // crate::debug!("{}", unsafe { str::from_utf8_unchecked(bytes) });
             Some(unsafe { ByteStr::from_utf8_unchecked(v.inner.clone()) })
         })
     }
     EnvironmentInfo {
         exthost_platform: get(headers, STAINLESS_OS).map(|b| match &*b {
-            "MacOS" => ByteStr::from_static("darwin"),
-            "Windows" => ByteStr::from_static("win32"),
-            "Linux" => ByteStr::from_static("linux"),
+            "darwin" | "MacOS" => ByteStr::from_static("darwin"),
+            "win32" | "Windows" => ByteStr::from_static("win32"),
+            "linux" | "Linux" => ByteStr::from_static("linux"),
             s => {
                 crate::debug!("hit platform: {s}");
                 b
             }
         }),
-        exthost_arch: get(headers, STAINLESS_ARCH),
+        exthost_arch: get(headers, STAINLESS_ARCH).map(|b| match &*b {
+            "x64" | "x86_64" => ByteStr::from_static("x64"),
+            "arm64" | "aarch64" => ByteStr::from_static("arm64"),
+            s => {
+                crate::debug!("hit arch: {s}");
+                b
+            }
+        }),
         local_timestamp: request_time.to_utc().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         cursor_version: crate::app::model::cursor_version::get(),
     }

@@ -1,9 +1,7 @@
-use core::num::NonZeroU16;
-
-use serde::Serialize;
-
 use super::CanonicalError;
 use crate::core::aiserver::v1::CustomErrorDetails;
+use core::num::NonZeroU16;
+use serde::Serialize;
 
 #[derive(Serialize)]
 pub struct CppError {

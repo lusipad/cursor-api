@@ -1,17 +1,17 @@
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::fmt;
-use std::mem::{ManuallyDrop, forget};
+use std::mem::forget;
 use std::ops::{Bound, RangeBounds};
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 use saa::Lock;
-use sdd::{AtomicShared, Ptr, Shared, Tag};
+use sdd::{AtomicRaw, Owned, RawPtr};
 
 use super::Leaf;
 use super::leaf::{Array, ArrayIter, InsertResult, Iter, RemoveResult, RevIter, range_contains};
 use super::node::Node;
 use crate::exit_guard::ExitGuard;
-use crate::utils::{LockPager, deref_unchecked, take_snapshot, unwrap_unchecked};
+use crate::utils::{LockPager, deref_unchecked, get_owned, take_snapshot, unwrap_unchecked};
 use crate::{Comparable, Guard};
 
 /// [`LeafNode`] contains a list of instances of `K, V` [`Leaf`].
@@ -22,9 +22,9 @@ pub struct LeafNode<K, V> {
     ///
     /// It stores the maximum key in the node, and key-value pairs are first pushed to this
     /// [`Leaf`] until it splits.
-    pub(super) unbounded_child: AtomicShared<Leaf<K, V>>,
+    pub(super) unbounded_child: AtomicRaw<Leaf<K, V>>,
     /// Children of the [`LeafNode`].
-    pub(super) children: Array<K, AtomicShared<Leaf<K, V>>>,
+    pub(super) children: Array<K, AtomicRaw<Leaf<K, V>>>,
     /// [`Lock`] to protect the [`LeafNode`].
     pub(super) lock: Lock,
 }
@@ -54,7 +54,7 @@ impl<K, V> LeafNode<K, V> {
     #[inline]
     pub(super) fn new_frozen() -> LeafNode<K, V> {
         LeafNode {
-            unbounded_child: AtomicShared::null(),
+            unbounded_child: AtomicRaw::null(),
             children: Array::new_frozen(),
             lock: Lock::default(),
         }
@@ -68,17 +68,29 @@ impl<K, V> LeafNode<K, V> {
             return;
         };
 
-        for pos in ArrayIter::new(&self.children) {
-            self.children
-                .remove_unchecked(self.children.metadata(), pos);
-            let (Some(node), _) = self.children.val(pos).swap((None, Tag::None), Acquire) else {
-                continue;
-            };
-            node.unlink(guard);
-        }
-        if let (Some(unbounded), _) = self.unbounded_child.swap((None, Tag::None), Acquire) {
-            unbounded.unlink(guard);
-        }
+        self.children.for_each_pos(
+            |frozen, _| {
+                if frozen {
+                    // This internal node has no ownership of any nodes.
+                    return None;
+                }
+                if let Some(unbounded) = get_owned(self.unbounded_child.load(Acquire, guard)) {
+                    self.unbounded_child.store(RawPtr::null(), Release);
+                    drop(unbounded);
+                }
+                Some(())
+            },
+            |pos, ()| {
+                let child = self.children.val(pos);
+                self.children
+                    .remove_unchecked(self.children.metadata(), pos);
+                if let Some(leaf) = get_owned(child.load(Acquire, guard)) {
+                    child.store(RawPtr::null(), Release);
+                    drop(leaf);
+                }
+            },
+        );
+
         locker.unlock_retire();
     }
 
@@ -98,7 +110,7 @@ where
     #[inline]
     pub(super) fn new() -> LeafNode<K, V> {
         LeafNode {
-            unbounded_child: AtomicShared::from(Shared::new_with(Leaf::new)),
+            unbounded_child: AtomicRaw::new(Owned::new_with(Leaf::new).into_raw()),
             children: Array::new(),
             lock: Lock::default(),
         }
@@ -133,15 +145,14 @@ where
                 //
                 // The `LeafNode` metadata is updated before a leaf is removed. This implies that
                 // the new `metadata` will be different from the current `metadata`.
-            } else {
-                let unbounded_ptr = self.unbounded_child.load(Acquire, guard);
-                if let Some(unbounded) = deref_unchecked(unbounded_ptr) {
-                    if self.children.validate(metadata) {
-                        return unbounded.search_entry(key);
-                    }
-                } else {
-                    return None;
+            } else if let Some(unbounded) =
+                deref_unchecked(self.unbounded_child.load(Acquire, guard))
+            {
+                if self.children.validate(metadata) {
+                    return unbounded.search_entry(key);
                 }
+            } else {
+                return None;
             }
         }
     }
@@ -163,15 +174,14 @@ where
                     }
                 }
                 // Data race resolution - see `LeafNode::search_entry`.
-            } else {
-                let unbounded_ptr = self.unbounded_child.load(Acquire, guard);
-                if let Some(unbounded) = deref_unchecked(unbounded_ptr) {
-                    if self.children.validate(metadata) {
-                        return unbounded.search_val(key);
-                    }
-                } else {
-                    return None;
+            } else if let Some(unbounded) =
+                deref_unchecked(self.unbounded_child.load(Acquire, guard))
+            {
+                if self.children.validate(metadata) {
+                    return unbounded.search_val(key);
                 }
+            } else {
+                return None;
             }
         }
     }
@@ -208,12 +218,9 @@ where
             if let Some((k, v)) = child.search_entry(key) {
                 return Ok(Some(reader(k, v)));
             }
-        } else {
-            let unbounded_ptr = self.unbounded_child.load(Acquire, guard);
-            if let Some(unbounded) = deref_unchecked(unbounded_ptr) {
-                if let Some((k, v)) = unbounded.search_entry(key) {
-                    return Ok(Some(reader(k, v)));
-                }
+        } else if let Some(unbounded) = deref_unchecked(self.unbounded_child.load(Acquire, guard)) {
+            if let Some((k, v)) = unbounded.search_entry(key) {
+                return Ok(Some(reader(k, v)));
             }
         }
         Ok(None)
@@ -224,15 +231,13 @@ where
     pub(super) fn min<'g>(&self, guard: &'g Guard) -> Option<Iter<'g, K, V>> {
         let mut min_leaf = None;
         for i in ArrayIter::new(&self.children) {
-            let child_ptr = self.children.val(i).load(Acquire, guard);
-            if let Some(child) = deref_unchecked(child_ptr) {
+            if let Some(child) = deref_unchecked(self.children.val(i).load(Acquire, guard)) {
                 min_leaf.replace(child);
                 break;
             }
         }
         if min_leaf.is_none() {
-            let unbounded_ptr = self.unbounded_child.load(Acquire, guard);
-            if let Some(unbounded) = deref_unchecked(unbounded_ptr) {
+            if let Some(unbounded) = deref_unchecked(self.unbounded_child.load(Acquire, guard)) {
                 min_leaf.replace(unbounded);
             }
         }
@@ -251,8 +256,7 @@ where
     /// Returns a [`RevIter`] pointing to the right-most leaf in the entire tree.
     #[inline]
     pub(super) fn max<'g>(&self, guard: &'g Guard) -> Option<RevIter<'g, K, V>> {
-        let unbounded_ptr = self.unbounded_child.load(Acquire, guard);
-        if let Some(unbounded) = deref_unchecked(unbounded_ptr) {
+        if let Some(unbounded) = deref_unchecked(self.unbounded_child.load(Acquire, guard)) {
             let mut iter = Iter::new(unbounded);
             while iter.jump(guard).is_some() {}
             iter.rewind();
@@ -512,12 +516,13 @@ where
                     }
                 }
                 RemoveRangeState::FullyContained => {
-                    if let Some(leaf) = child.swap((None, Tag::None), AcqRel).0 {
-                        leaf.unlink(guard);
-                    }
                     // There can be another thread inserting keys into the leaf, and this may render
                     // those operations completely ineffective.
                     self.children.remove_unchecked(self.children.metadata(), i);
+                    if let Some(leaf) = get_owned(child.load(Acquire, guard)) {
+                        child.store(RawPtr::null(), Release);
+                        leaf.unlink(guard);
+                    }
                 }
                 RemoveRangeState::MaybeAbove => {
                     if let Some(leaf) = deref_unchecked(child.load(Acquire, guard)) {
@@ -573,8 +578,8 @@ where
     #[allow(clippy::too_many_lines)]
     fn split_leaf<P: LockPager>(
         &self,
-        full_leaf_ptr: Ptr<Leaf<K, V>>,
-        full_leaf: &AtomicShared<Leaf<K, V>>,
+        full_leaf_ptr: RawPtr<Leaf<K, V>>,
+        full_leaf: &AtomicRaw<Leaf<K, V>>,
         pager: &mut P,
         guard: &Guard,
     ) -> Result<bool, ()> {
@@ -598,8 +603,7 @@ where
         let target = unwrap_unchecked(deref_unchecked(full_leaf_ptr));
 
         // The metadata of `target` should be frozen for stable distribution of entries.
-        let frozen = target.freeze();
-        debug_assert!(frozen);
+        target.freeze();
         let exit_guard = ExitGuard::new((), |()| {
             target.unfreeze();
         });
@@ -622,19 +626,15 @@ where
                 // `v` is moved, not cloned; those new leaves do not own them until unfrozen.
                 if i < boundary {
                     let low_key_leaf =
-                        low_key_leaf.get_or_insert_with(|| Shared::new_with(Leaf::new_frozen));
-                    low_key_leaf.insert_unchecked(
-                        ManuallyDrop::into_inner(take_snapshot(k)),
-                        ManuallyDrop::into_inner(take_snapshot(v)),
-                        i,
-                    );
+                        low_key_leaf.get_or_insert_with(|| Owned::new_with(Leaf::new_frozen));
+                    low_key_leaf.insert_unchecked(take_snapshot(k), take_snapshot(v), i);
                     boundary_pos = i;
                 } else {
                     let high_key_leaf =
-                        high_key_leaf.get_or_insert_with(|| Shared::new_with(Leaf::new_frozen));
+                        high_key_leaf.get_or_insert_with(|| Owned::new_with(Leaf::new_frozen));
                     high_key_leaf.insert_unchecked(
-                        ManuallyDrop::into_inner(take_snapshot(k)),
-                        ManuallyDrop::into_inner(take_snapshot(v)),
+                        take_snapshot(k),
+                        take_snapshot(v),
                         i - boundary,
                     );
                 }
@@ -653,7 +653,7 @@ where
         // - T1 iterates over entries from L1 and L2, and cannot see entries in L2_1.
         //
         // The locking prevents T1 from splitting L2 until L1_2 becomes reachable via tree.
-        let low_key_leaf = low_key_leaf.unwrap_or_else(|| Shared::new_with(Leaf::new_frozen));
+        let low_key_leaf = low_key_leaf.unwrap_or_else(|| Owned::new_with(Leaf::new_frozen));
         low_key_leaf.lock.lock_sync();
         let low_key_leaf_lock = &low_key_leaf.get_guarded_ref(guard).lock;
 
@@ -661,9 +661,8 @@ where
             let low_key_max = low_key_leaf.key(boundary_pos).clone();
 
             // Unfreeze the leaves; those leaves now take ownership of the copied values.
-            let unfrozen_low = low_key_leaf.unfreeze();
-            let unfrozen_high = high_key_leaf.unfreeze();
-            debug_assert!(unfrozen_low && unfrozen_high);
+            low_key_leaf.unfreeze();
+            high_key_leaf.unfreeze();
 
             low_key_leaf
                 .next
@@ -692,18 +691,18 @@ where
             // Take the max key-value stored in the low key leaf as the leaf key.
             let result = self
                 .children
-                .insert(low_key_max, AtomicShared::from(low_key_leaf));
+                .insert(low_key_max, AtomicRaw::new(low_key_leaf.into_raw()));
             debug_assert!(matches!(result, InsertResult::Success));
             let released = low_key_leaf_lock.release_lock();
             debug_assert!(released);
 
-            full_leaf.swap((Some(high_key_leaf), Tag::None), Release);
+            debug_assert!(full_leaf.load(Relaxed, guard) == full_leaf_ptr);
+            full_leaf.store(high_key_leaf.into_raw(), Release);
             let released = high_key_leaf_lock.release_lock();
             debug_assert!(released);
         } else {
             // Unfreeze the leaf; it now takes ownership of the copied values.
-            let unfrozen = low_key_leaf.unfreeze();
-            debug_assert!(unfrozen);
+            low_key_leaf.unfreeze();
 
             target.replace_link(
                 |prev_next, next_prev, prev_ptr, next_ptr| {
@@ -720,13 +719,15 @@ where
                 guard,
             );
 
-            full_leaf.swap((Some(low_key_leaf), Tag::None), Release);
+            debug_assert!(full_leaf.load(Relaxed, guard) == full_leaf_ptr);
+            full_leaf.store(low_key_leaf.into_raw(), Release);
             let released = low_key_leaf_lock.release_lock();
             debug_assert!(released);
         }
 
         // The removed leaf stays frozen: ownership of the copied values is transferred.
         exit_guard.forget();
+        drop(get_owned(full_leaf_ptr));
 
         Ok(true)
     }
@@ -742,11 +743,11 @@ where
 
         let mut fully_empty = true;
         for i in ArrayIter::new(&self.children) {
-            let child = self.children.val(i);
-            let leaf_ptr = child.load(Acquire, guard);
-            let leaf = unwrap_unchecked(deref_unchecked(leaf_ptr));
-            if leaf.is_retired() {
-                leaf.unlink(guard);
+            let leaf = self.children.val(i);
+            let leaf_ptr = leaf.load(Acquire, guard);
+            let leaf_ref = unwrap_unchecked(deref_unchecked(leaf_ptr));
+            if leaf_ref.is_retired() {
+                leaf_ref.unlink(guard);
 
                 // As soon as the leaf is removed from the leaf node, the next leaf can store keys
                 // that are smaller than those that were previously stored in the removed leaf node.
@@ -755,10 +756,8 @@ where
                 // `unlink`, the prev/next leaves will not point to this leaf anymore.
                 let result = self.children.remove_unchecked(self.children.metadata(), i);
                 debug_assert_ne!(result, RemoveResult::Fail);
-
-                // The pointer is set to null after the metadata of `self.children` is updated
-                // to enable readers to retry when they find it being null.
-                child.swap((None, Tag::None), Release);
+                leaf.store(RawPtr::null(), Release);
+                drop(get_owned(leaf_ptr));
             } else {
                 fully_empty = false;
             }
@@ -766,10 +765,12 @@ where
 
         // The unbounded leaf becomes unreachable after all the other leaves are gone.
         if fully_empty {
-            if let Some(unbounded) = deref_unchecked(self.unbounded_child.load(Acquire, guard)) {
+            let unbounded_ptr = self.unbounded_child.load(Acquire, guard);
+            if let Some(unbounded) = deref_unchecked(unbounded_ptr) {
                 if unbounded.is_retired() {
                     unbounded.unlink(guard);
-                    self.unbounded_child.swap((None, Tag::None), Release);
+                    self.unbounded_child.store(RawPtr::null(), Release);
+                    drop(get_owned(unbounded_ptr));
                 } else {
                     fully_empty = false;
                 }
@@ -793,22 +794,31 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let guard = Guard::new();
         f.write_str("LeafNode { ")?;
-        write!(f, "retired: {}, ", self.is_retired())?;
-        self.children.for_each(|i, rank, entry, removed| {
-            if let Some((k, l)) = entry {
-                if let Some(l) = deref_unchecked(l.load(Acquire, &guard)) {
-                    write!(f, "{i}: ({k:?}, {rank}, removed: {removed}, {l:?}), ")?;
-                } else {
-                    write!(f, "{i}: ({k:?}, {rank}, removed: {removed}, null), ")?;
+        let mut state = (false, false);
+        self.children.for_each_all(
+            |frozen, retired| {
+                state.0 = frozen;
+                state.1 = retired;
+                true
+            },
+            |i, rank, entry, removed| {
+                if let Some((k, l)) = entry {
+                    if let Some(l) = deref_unchecked(l.load(Acquire, &guard)) {
+                        write!(f, "{i}: ({k:?}, {rank}, removed: {removed}, {l:?}), ")?;
+                    } else {
+                        write!(f, "{i}: ({k:?}, {rank}, removed: {removed}, null), ")?;
+                    }
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            },
+        )?;
         if let Some(unbounded) = deref_unchecked(self.unbounded_child.load(Acquire, &guard)) {
-            write!(f, "unbounded: {unbounded:?}")?;
+            write!(f, "unbounded: {unbounded:?}, ")?;
         } else {
-            write!(f, "unbounded: null")?;
+            write!(f, "unbounded: null, ")?;
         }
+        write!(f, "frozen: {}, ", state.0)?;
+        write!(f, "retired: {}", state.1)?;
         f.write_str(" }")
     }
 }
@@ -816,11 +826,21 @@ where
 impl<K, V> Drop for LeafNode<K, V> {
     #[inline]
     fn drop(&mut self) {
-        if self.is_retired() {
-            // The ownership of `unbounded_child` was moved to new nodes.
-            let _unbounded =
-                ManuallyDrop::new(self.unbounded_child.swap((None, Tag::None), Acquire).0);
-        }
+        // Need to manually drop each leaf node.
+        self.children.for_each_pos(
+            |frozen, _| {
+                if frozen {
+                    // This internal node has no ownership of any nodes.
+                    return None;
+                }
+                let guard = Guard::new();
+                drop(get_owned(self.unbounded_child.load(Acquire, &guard)));
+                Some(guard)
+            },
+            |pos, guard| {
+                drop(get_owned(self.children.val(pos).load(Acquire, guard)));
+            },
+        );
     }
 }
 
@@ -901,6 +921,7 @@ impl RemoveRangeState {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use tokio::sync::Barrier;
 
@@ -1005,9 +1026,9 @@ mod test {
     async fn parallel() {
         let num_tasks = 8;
         let workload_size = 64;
-        let barrier = Shared::new(Barrier::new(num_tasks));
+        let barrier = Arc::new(Barrier::new(num_tasks));
         for _ in 0..16 {
-            let leaf_node = Shared::new(LeafNode::new());
+            let leaf_node = Arc::new(LeafNode::new());
             assert!(
                 leaf_node
                     .insert(usize::MAX, usize::MAX, &mut (), &Guard::new())
@@ -1106,9 +1127,9 @@ mod test {
         let workload_size = 64_usize;
         for _ in 0..16 {
             for k in 0..=workload_size {
-                let barrier = Shared::new(Barrier::new(num_tasks));
-                let leaf_node: Shared<LeafNode<usize, usize>> = Shared::new(LeafNode::new());
-                let inserted: Shared<AtomicBool> = Shared::new(AtomicBool::new(false));
+                let barrier = Arc::new(Barrier::new(num_tasks));
+                let leaf_node: Arc<LeafNode<usize, usize>> = Arc::new(LeafNode::new());
+                let inserted: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
                 let mut task_handles = Vec::with_capacity(num_tasks);
                 for _ in 0..num_tasks {
                     let barrier_clone = barrier.clone();

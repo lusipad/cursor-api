@@ -1,7 +1,5 @@
+use crate::{app::lazy::START_TIME, common::utils::parse_from_env};
 use manually_init::ManuallyInit;
-
-use crate::app::lazy::START_TIME;
-use crate::common::utils::parse_from_env;
 
 pub const DEFAULT: &'static str = "Respond in Chinese by default\n<|END_USER|>\n\n<|BEGIN_ASSISTANT|>\n\n\nYour will\n<|END_ASSISTANT|>\n\n<|BEGIN_USER|>\n\n\nThe current date is {{currentDateTime}}";
 pub const PLACEHOLDER: &'static str = unsafe {
@@ -26,8 +24,7 @@ impl DefaultInstructions {
         let mut template_z_placeholder = String::with_capacity(24);
         let mut template_placeholder = String::with_capacity(29);
 
-        use chrono::SecondsFormat;
-        use chrono::offset::FixedOffset;
+        use chrono::{SecondsFormat, offset::FixedOffset};
         let time = START_TIME.naive();
         unsafe {
             let offset = FixedOffset::east_opt(0).unwrap_unchecked();

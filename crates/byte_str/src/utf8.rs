@@ -18,6 +18,7 @@ mod ascii;
     )
 ))]
 #[allow(unused)]
+#[rustfmt::skip]
 mod simd_funcs;
 
 pub use ascii::is_valid_ascii;

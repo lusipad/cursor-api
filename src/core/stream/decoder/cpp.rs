@@ -6,9 +6,12 @@
 //! - 单个 protobuf 消息可能生成多个事件（并行检查）
 //! - ModelInfo/RangeReplace 与 Text 互斥（协议层语义）
 
-use crate::core::{
-    aiserver::v1::StreamCppResponse,
-    error::{CppError, CursorError},
+use crate::{
+    common::utils::hex,
+    core::{
+        aiserver::v1::StreamCppResponse,
+        error::{CppError, CursorError},
+    },
 };
 use alloc::borrow::Cow;
 use byte_str::ByteStr;

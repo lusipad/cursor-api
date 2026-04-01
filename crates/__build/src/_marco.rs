@@ -1,10 +1,12 @@
+pub(crate) mod support;
+
 macro_rules! generate_static_variable {
   (
     $variable_name: ident
     $variable_type: ty
   ) => {
-    pub(self) static $variable_name: $crate::_marco::Variable<$variable_type> =
-      $crate::_marco::uninit_variable();
+    pub(self) static $variable_name: $crate::_marco::support::Variable<$variable_type> =
+      $crate::_marco::support::uninit_variable();
     #[inline]
     pub(crate) unsafe fn get_unchecked() -> &'static $variable_type {
       unsafe { (&*$variable_name.0.get()).assume_init_ref() }
@@ -14,13 +16,6 @@ macro_rules! generate_static_variable {
       unsafe { (&mut *$variable_name.0.get()).write(_initialize()) };
     }
   };
-}
-pub(crate) struct Variable<T>(pub(crate) ::core::cell::UnsafeCell<::core::mem::MaybeUninit<T>>);
-unsafe impl<T> Send for Variable<T> {}
-unsafe impl<T> Sync for Variable<T> {}
-#[inline(always)]
-pub(crate) const fn uninit_variable<T>() -> Variable<T> {
-  Variable(::core::cell::UnsafeCell::new(::core::mem::MaybeUninit::uninit()))
 }
 
 macro_rules! generate_variable_get {
@@ -41,7 +36,7 @@ macro_rules! generate_variable_get {
   };
 }
 
-macro_rules! reexport_info_types {
+macro_rules! re_export_info_types {
   {
     $(
       $info_name: ident

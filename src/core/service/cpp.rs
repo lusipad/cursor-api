@@ -93,6 +93,8 @@ pub async fn handle_cpp_config(
         use_pri,
         cookie: headers.remove(COOKIE),
         exact_length: Some(data.len()),
+        platform: None,
+        arch: None,
     });
 
     match CollectBytesParts(req.body(data)).await {
@@ -133,6 +135,8 @@ pub async fn handle_cpp_models(
         use_pri,
         cookie: headers.remove(COOKIE),
         exact_length: Some(0),
+        platform: None,
+        arch: None,
     });
 
     match CollectBytesParts(req).await {
@@ -180,18 +184,19 @@ pub async fn handle_upload_file(
         use_pri,
         cookie: headers.remove(COOKIE),
         exact_length: Some(data.len()),
+        platform: None,
+        arch: None,
     });
 
     match CollectBytesParts(req.body(data)).await {
         Ok((parts, bytes)) => {
             match direct::decode::<FsUploadFileResponse>(&parts.headers, &bytes) {
                 Ok(Ok(data)) => {
-                    let body = __unwrap!(serde_json::to_vec(&data));
+                    let body = __unwrap!(sonic_rs::to_vec(&data));
                     Ok(json_response_with_upstream_parts(parts, body))
                 }
                 Ok(Err(cursor_err)) => {
-                    let body =
-                        __unwrap!(serde_json::to_vec(&cursor_err.canonical().into_generic()));
+                    let body = __unwrap!(sonic_rs::to_vec(&cursor_err.canonical().into_generic()));
                     Err(json_response_with_upstream_parts(parts, body))
                 }
                 Err(e) => Err(e.into_generic_tuple().into_response()),
@@ -235,16 +240,18 @@ pub async fn handle_sync_file(
         use_pri,
         cookie: headers.remove(COOKIE),
         exact_length: Some(data.len()),
+        platform: None,
+        arch: None,
     });
 
     match CollectBytesParts(req.body(data)).await {
         Ok((parts, bytes)) => match direct::decode::<FsSyncFileResponse>(&parts.headers, &bytes) {
             Ok(Ok(data)) => {
-                let body = __unwrap!(serde_json::to_vec(&data));
+                let body = __unwrap!(sonic_rs::to_vec(&data));
                 Ok(json_response_with_upstream_parts(parts, body))
             }
             Ok(Err(cursor_err)) => {
-                let body = __unwrap!(serde_json::to_vec(&cursor_err.canonical().into_generic()));
+                let body = __unwrap!(sonic_rs::to_vec(&cursor_err.canonical().into_generic()));
                 Err(json_response_with_upstream_parts(parts, body))
             }
             Err(e) => Err(e.into_generic_tuple().into_response()),
@@ -287,6 +294,8 @@ pub async fn handle_stream_cpp(
         use_pri,
         cookie: headers.remove(COOKIE),
         exact_length: Some(data.len()),
+        platform: None,
+        arch: None,
     });
 
     let res = match req.body(data).send().await {
@@ -313,7 +322,7 @@ pub async fn handle_stream_cpp(
         vector.extend_from_slice(message.type_name().as_bytes());
         vector.extend_from_slice(b"\ndata: ");
         let vector = {
-            let mut ser = serde_json::Serializer::new(vector);
+            let mut ser = sonic_rs::Serializer::new(vector);
             __unwrap!(serde::Serialize::serialize(message, &mut ser));
             ser.into_inner()
         };

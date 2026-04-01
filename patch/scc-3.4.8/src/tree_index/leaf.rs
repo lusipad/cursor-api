@@ -1,32 +1,33 @@
 use std::cmp::Ordering;
 use std::fmt;
-use std::mem::{ManuallyDrop, forget, needs_drop};
+use std::mem::{forget, needs_drop};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::{Deref, RangeBounds};
 use std::ptr;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 #[cfg(not(feature = "loom"))]
 use std::sync::atomic::{AtomicPtr, AtomicUsize};
 
+#[cfg(feature = "loom")]
+use loom::sync::atomic::{AtomicPtr, AtomicUsize};
 use saa::Lock;
 
 use crate::data_block::DataBlock;
-use crate::utils::take_snapshot;
+use crate::utils::{likely, take_snapshot};
 use crate::{Comparable, Guard};
-#[cfg(feature = "loom")]
-use loom::sync::atomic::{AtomicPtr, AtomicUsize};
 
 /// [`Leaf`] is an ordered array of key-value pairs.
 ///
 /// A constructed key-value pair entry is never dropped until the entire [`Leaf`] instance is
 /// dropped.
 pub struct Leaf<K, V> {
+    /// [`Array`] containing the key-value pairs.
+    array: Array<K, V>,
     /// Pointer to the previous [`Leaf`].
     pub(super) prev: AtomicPtr<Leaf<K, V>>,
     /// Pointer to the next [`Leaf`].
     pub(super) next: AtomicPtr<Leaf<K, V>>,
-    /// [`Array`] containing the key-value pairs.
-    array: Array<K, V>,
     /// Lock to protect the linked list.
     pub(super) lock: Lock,
 }
@@ -35,24 +36,29 @@ pub struct Array<K, V> {
     /// Metadata for entry and array states.
     ///
     /// The state of each entry is as follows.
-    /// * `0`: `uninit`.
+    /// * `0`: `unreachable`.
     /// * `1 - array_size`: `rank`.
-    /// * `max`: `removed`.
     ///
     /// The entry state transitions as follows.
-    /// * `uninit -> removed -> rank -> removed`.
+    /// * `unreachable -> rank -> unreachable`.
     metadata: AtomicUsize,
     /// [`DataBlock`] containing the key-value pairs.
-    data_block: DataBlock<K, V, { DIMENSION.num_entries as usize }>,
+    data_block: DataBlock<K, V, { DIMENSION.len as usize }>,
+    /// Bitmap representing the occupancy state of each entry in the data block.
+    bitmap: AtomicU32,
 }
 
 /// The number of entries and number of state bits per entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Dimension {
-    /// Number of entries in an [`Array`].
-    pub num_entries: u8,
+    /// Length of an [`Array`].
+    pub len: u8,
     /// Number of bits required per entry metadata.
-    pub num_bits_per_entry: u8,
+    pub bit_len: u8,
+    /// Bitmask to priorities a range of slots when inserting values.
+    pub priority_slot_mask: u32,
+    /// Priority slot bit range in the array metadata.
+    pub priority_slot_bit_range: (u32, u32),
 }
 
 /// Insertion result.
@@ -84,7 +90,7 @@ pub struct ArrayIter {
     /// Snapshot of the metadata of [`Array`].
     metadata: usize,
     /// Rank to position mapping.
-    pos: [u8; DIMENSION.num_entries as usize + 1],
+    pos: [u8; DIMENSION.len as usize + 1],
 }
 
 /// Array entry iterator, reversed.
@@ -93,7 +99,7 @@ pub struct ArrayRevIter {
     /// Snapshot of the metadata of [`Array`].
     metadata: usize,
     /// Rank to position mapping.
-    pos: [u8; DIMENSION.num_entries as usize + 1],
+    pos: [u8; DIMENSION.len as usize + 1],
 }
 
 /// Leaf entry iterator.
@@ -135,9 +141,9 @@ impl<K, V> Leaf<K, V> {
     #[cfg(not(feature = "loom"))]
     pub(super) const fn new() -> Leaf<K, V> {
         Leaf {
+            array: Array::new(),
             prev: AtomicPtr::new(ptr::null_mut()),
             next: AtomicPtr::new(ptr::null_mut()),
-            array: Array::new(),
             lock: Lock::new(),
         }
     }
@@ -147,9 +153,9 @@ impl<K, V> Leaf<K, V> {
     #[cfg(feature = "loom")]
     pub(super) fn new() -> Leaf<K, V> {
         Leaf {
+            array: Array::new(),
             prev: AtomicPtr::new(ptr::null_mut()),
             next: AtomicPtr::new(ptr::null_mut()),
-            array: Array::new(),
             lock: Lock::new(),
         }
     }
@@ -159,9 +165,9 @@ impl<K, V> Leaf<K, V> {
     #[cfg(not(feature = "loom"))]
     pub(super) const fn new_frozen() -> Leaf<K, V> {
         Leaf {
+            array: Array::new_frozen(),
             prev: AtomicPtr::new(ptr::null_mut()),
             next: AtomicPtr::new(ptr::null_mut()),
-            array: Array::new_frozen(),
             lock: Lock::new(),
         }
     }
@@ -171,9 +177,9 @@ impl<K, V> Leaf<K, V> {
     #[cfg(feature = "loom")]
     pub(super) fn new_frozen() -> Leaf<K, V> {
         Leaf {
+            array: Array::new_frozen(),
             prev: AtomicPtr::new(ptr::null_mut()),
             next: AtomicPtr::new(ptr::null_mut()),
-            array: Array::new_frozen(),
             lock: Lock::new(),
         }
     }
@@ -323,6 +329,7 @@ impl<K, V> Array<K, V> {
         Array {
             metadata: AtomicUsize::new(0),
             data_block: DataBlock::new(),
+            bitmap: AtomicU32::new(0),
         }
     }
 
@@ -332,6 +339,7 @@ impl<K, V> Array<K, V> {
         Array {
             metadata: AtomicUsize::new(0),
             data_block: DataBlock::new(),
+            bitmap: AtomicU32::new(0),
         }
     }
 
@@ -342,6 +350,7 @@ impl<K, V> Array<K, V> {
         Array {
             metadata: AtomicUsize::new(Dimension::FROZEN),
             data_block: DataBlock::new(),
+            bitmap: AtomicU32::new(0),
         }
     }
 
@@ -351,21 +360,14 @@ impl<K, V> Array<K, V> {
         Array {
             metadata: AtomicUsize::new(Dimension::FROZEN),
             data_block: DataBlock::new(),
+            bitmap: AtomicU32::new(0),
         }
     }
 
     /// Returns `true` if the [`Array`] has no reachable entry.
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
-        let mut mutable_metadata = self.metadata.load(Relaxed) & (!Dimension::state_mask());
-        while mutable_metadata != 0 {
-            let rank = DIMENSION.rank_first(mutable_metadata);
-            if rank != Dimension::uninit_rank() && rank != DIMENSION.removed_rank() {
-                return false;
-            }
-            mutable_metadata >>= DIMENSION.num_bits_per_entry;
-        }
-        true
+        self.metadata.load(Relaxed) & (!Dimension::state_mask()) == 0
     }
 
     /// Returns `true` if the [`Array`] is full or retired.
@@ -373,9 +375,8 @@ impl<K, V> Array<K, V> {
     /// This may return `true` even when there is a slot if there was an insertion failure.
     #[inline]
     pub(super) fn is_full(&self) -> bool {
-        let metadata = self.metadata.load(Relaxed);
-        let rank = DIMENSION.rank(metadata, DIMENSION.num_entries - 1);
-        rank != Dimension::uninit_rank() || Dimension::is_retired(metadata)
+        self.bitmap.load(Relaxed).trailing_ones() == u32::from(DIMENSION.len)
+            || Dimension::is_retired(self.metadata.load(Relaxed))
     }
 
     /// Returns `true` if the [`Array`] has retired.
@@ -408,59 +409,46 @@ impl<K, V> Array<K, V> {
     /// `rank` is calculated as `pos + 1`.
     #[inline]
     pub(super) fn insert_unchecked(&self, key: K, val: V, pos: u8) {
-        debug_assert!(pos < DIMENSION.num_entries);
+        debug_assert!(pos < DIMENSION.len);
 
         self.data_block.write(pos as usize, key, val);
+        self.bitmap
+            .store(self.bitmap.load(Relaxed) | (1 << pos), Relaxed);
 
         let metadata = self.metadata.load(Relaxed);
         debug_assert!(Dimension::is_frozen(metadata));
 
-        let new_metadata = DIMENSION.augment(metadata, pos, pos + 1);
-        self.metadata.store(new_metadata, Release);
+        self.metadata.store(
+            metadata | ((pos as usize + 1) << (pos * DIMENSION.bit_len)),
+            Release,
+        );
     }
 
     /// Removes the entry at the specified position without checking the metadata.
     #[inline]
     pub(super) fn remove_unchecked(&self, mut metadata: usize, pos: u8) -> RemoveResult {
         loop {
-            let mut empty = true;
-            let mut mutable_metadata = metadata;
-            for j in 0..DIMENSION.num_entries {
-                if mutable_metadata == 0 {
-                    break;
-                }
-                if pos != j {
-                    let rank = DIMENSION.rank_first(mutable_metadata);
-                    if rank != Dimension::uninit_rank() && rank != DIMENSION.removed_rank() {
-                        empty = false;
-                        break;
-                    }
-                }
-                mutable_metadata >>= DIMENSION.num_bits_per_entry;
-            }
-
-            let mut new_metadata = metadata | DIMENSION.rank_mask(pos);
-            if empty {
-                new_metadata = Dimension::retire(new_metadata);
+            let mut new_metadata = metadata & !DIMENSION.rank_mask(pos);
+            if new_metadata == 0 {
+                new_metadata |= Dimension::RETIRED;
             }
             match self
                 .metadata
                 .compare_exchange(metadata, new_metadata, AcqRel, Acquire)
             {
                 Ok(_) => {
-                    if empty {
+                    if new_metadata == Dimension::RETIRED {
                         return RemoveResult::Retired;
                     }
                     return RemoveResult::Success;
                 }
-                Err(actual) => {
-                    if DIMENSION.rank(actual, pos) == DIMENSION.removed_rank() {
+                Err(current_metadata) => {
+                    if current_metadata & DIMENSION.rank_mask(pos) == 0 {
                         return RemoveResult::Fail;
-                    }
-                    if Dimension::is_frozen(actual) {
+                    } else if Dimension::is_frozen(current_metadata) {
                         return RemoveResult::Frozen;
                     }
-                    metadata = actual;
+                    metadata = current_metadata;
                 }
             }
         }
@@ -475,30 +463,17 @@ impl<K, V> Array<K, V> {
 
     /// Freezes the [`Array`] temporarily.
     #[inline]
-    pub(super) fn freeze(&self) -> bool {
-        self.metadata
-            .fetch_update(AcqRel, Acquire, |p| {
-                if Dimension::is_frozen(p) {
-                    None
-                } else {
-                    Some(Dimension::freeze(p))
-                }
-            })
-            .is_ok()
+    pub(super) fn freeze(&self) {
+        let prev = self.metadata.fetch_or(Dimension::FROZEN, AcqRel);
+        debug_assert!(!Dimension::is_frozen(prev));
     }
 
     /// Unfreezes the [`Array`].
     #[inline]
-    pub(super) fn unfreeze(&self) -> bool {
-        self.metadata
-            .fetch_update(Release, Relaxed, |p| {
-                if Dimension::is_frozen(p) {
-                    Some(Dimension::unfreeze(p))
-                } else {
-                    None
-                }
-            })
-            .is_ok()
+    pub(super) fn unfreeze(&self) {
+        let metadata = self.metadata.load(Relaxed);
+        debug_assert!(Dimension::is_frozen(metadata));
+        self.metadata.store(Dimension::unfreeze(metadata), Release);
     }
 
     /// Distributes entries to other arrays.
@@ -524,6 +499,72 @@ impl<K, V> Array<K, V> {
         true
     }
 
+    /// Iterates over reachable positions.
+    #[inline]
+    pub(crate) fn for_each_pos<C, P: FnOnce(bool, bool) -> Option<C>, F: FnMut(u8, &mut C)>(
+        &self,
+        p: P,
+        mut f: F,
+    ) {
+        let metadata = self.metadata.load(Acquire);
+        if let Some(mut context) = p(
+            Dimension::is_frozen(metadata),
+            Dimension::is_retired(metadata),
+        ) {
+            let mut mutable_metadata = metadata & (!Dimension::state_mask());
+            for pos in 0..DIMENSION.len {
+                if mutable_metadata == 0 {
+                    break;
+                }
+                let rank = DIMENSION.rank_first(mutable_metadata);
+                if rank != 0 {
+                    f(pos, &mut context);
+                }
+                mutable_metadata >>= DIMENSION.bit_len;
+            }
+        }
+    }
+
+    /// Iterates over initialized entries, including unreachable ones.
+    #[inline]
+    pub(crate) fn for_each_all<
+        E,
+        P: FnOnce(bool, bool) -> bool,
+        F: FnMut(u8, u8, Option<(&K, &V)>, bool) -> Result<(), E>,
+    >(
+        &self,
+        p: P,
+        mut f: F,
+    ) -> Result<(), E> {
+        let metadata = self.metadata.load(Acquire);
+        if p(
+            Dimension::is_frozen(metadata),
+            Dimension::is_retired(metadata),
+        ) {
+            let mut mutable_metadata = metadata & (!Dimension::state_mask());
+            let mut bitmap = self.bitmap.load(Relaxed);
+            for pos in 0..DIMENSION.len {
+                if mutable_metadata == 0 && bitmap == 0 {
+                    break;
+                }
+                let rank = DIMENSION.rank_first(mutable_metadata);
+                if (bitmap & 1) == 0 {
+                    f(pos, rank, None, false)?;
+                } else {
+                    let entry = (self.key(pos), self.val(pos));
+                    if rank == 0 {
+                        f(pos, rank, Some(entry), true)?;
+                    } else {
+                        f(pos, rank, Some(entry), false)?;
+                    }
+                }
+                bitmap >>= 1;
+                mutable_metadata >>= DIMENSION.bit_len;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the recommended number of entries that the left-side array should store when an
     /// [`Array`] is split, and the number of valid entries in the [`Array`].
     ///
@@ -539,15 +580,24 @@ impl<K, V> Array<K, V> {
     /// - Returns 6 for `rank = [1, 2, 3, 4, 5, 6, 7]`.
     /// - Returns 1 for `rank = [7, 6, 5, 4, 3, 2, 1]`.
     #[inline]
-    const fn optimal_boundary(mut mutable_metadata: usize) -> (u8, usize) {
-        let mut boundary = DIMENSION.num_entries;
+    const fn optimal_boundary(mut metadata: usize) -> (u8, usize) {
+        let mut boundary = DIMENSION.len;
         let mut prev_rank = 0;
         let mut len = 0;
 
-        mutable_metadata &= !Dimension::state_mask();
-        while mutable_metadata != 0 {
-            let rank = DIMENSION.rank_first(mutable_metadata);
-            if rank != Dimension::uninit_rank() && rank != DIMENSION.removed_rank() {
+        // Need to switch the priority bit range with the other part.
+        //
+        // `[up]0b_0111_0011_[u:8/lp]010_[l:5/mp]_10000`: `0b_[up]0111_0011_[mp]_10000_[lp]010`
+        metadata &= !Dimension::state_mask();
+        let (lower_boundary, upper_boundary) = DIMENSION.priority_slot_bit_range;
+        let lower_part_bit_len = upper_boundary - lower_boundary;
+        let lower_part = (metadata >> lower_boundary) & ((1 << lower_part_bit_len) - 1);
+        let middle_part = (metadata & ((1 << lower_boundary) - 1)) << lower_part_bit_len;
+        let upper_part = metadata & (!((1 << upper_boundary) - 1));
+        metadata = upper_part | middle_part | lower_part;
+        while metadata != 0 {
+            let rank = DIMENSION.rank_first(metadata);
+            if rank != 0 {
                 len += 1;
                 if prev_rank >= rank {
                     boundary -= 1;
@@ -556,11 +606,11 @@ impl<K, V> Array<K, V> {
                 }
                 prev_rank = rank;
             }
-            mutable_metadata >>= DIMENSION.num_bits_per_entry;
+            metadata >>= DIMENSION.bit_len;
         }
 
-        let min = DIMENSION.num_entries / 2 + 1;
-        let max = DIMENSION.num_entries + DIMENSION.num_entries / 2 - 1;
+        let min = DIMENSION.len / 2 + 1;
+        let max = DIMENSION.len + DIMENSION.len / 2 - 1;
         let clamped_boundary = if boundary < min {
             min
         } else if boundary > max {
@@ -569,23 +619,23 @@ impl<K, V> Array<K, V> {
             boundary
         };
 
-        (clamped_boundary - DIMENSION.num_entries / 2, len)
+        (clamped_boundary - DIMENSION.len / 2, len)
     }
 
     /// Builds a rank to position map from metadata.
     #[inline]
-    const fn build_index(mut mutable_metadata: usize) -> [u8; DIMENSION.num_entries as usize + 1] {
-        let mut index = [u8::MAX; DIMENSION.num_entries as usize + 1];
+    const fn build_index(mut mutable_metadata: usize) -> [u8; DIMENSION.len as usize + 1] {
+        let mut index = [u8::MAX; DIMENSION.len as usize + 1];
         let mut pos = 0;
         *at_mut(&mut index, 0) = 0;
         mutable_metadata &= !Dimension::state_mask();
         while mutable_metadata != 0 {
             let rank = DIMENSION.rank_first(mutable_metadata);
-            if rank != Dimension::uninit_rank() && rank != DIMENSION.removed_rank() {
+            if rank != 0 {
                 *at_mut(&mut index, rank as usize) = pos;
             }
             pos += 1;
-            mutable_metadata >>= DIMENSION.num_bits_per_entry;
+            mutable_metadata >>= DIMENSION.bit_len;
         }
         index
     }
@@ -599,93 +649,80 @@ where
     /// Inserts a key-value pair.
     #[inline]
     pub(super) fn insert(&self, key: K, val: V) -> InsertResult<K, V> {
-        let mut free_pos = DIMENSION.num_entries;
-        let mut reserved = false;
+        let mut reserved_pos = DIMENSION.len;
         let mut metadata = self.metadata.load(Acquire);
         loop {
-            if Dimension::is_frozen(metadata) || Dimension::is_retired(metadata) {
-                if reserved {
-                    self.metadata
-                        .fetch_and(!DIMENSION.rank_mask(free_pos), Release);
+            if (metadata & Dimension::state_mask()) != 0 {
+                if reserved_pos != DIMENSION.len {
+                    self.bitmap.fetch_and(!(1 << reserved_pos), Release);
                 }
                 return InsertResult::Full(key, val);
             }
 
-            let mut min_max_rank = DIMENSION.removed_rank();
+            let mut min_max_rank = u8::MAX;
             let mut max_min_rank = 0;
             let mut new_metadata = metadata;
             let mut mutable_metadata = metadata;
-            for pos in 0..DIMENSION.num_entries {
+            for pos in 0..DIMENSION.len {
                 if mutable_metadata == 0 {
-                    if free_pos == DIMENSION.num_entries {
-                        free_pos = pos;
-                    }
                     break;
                 }
                 let rank = DIMENSION.rank_first(mutable_metadata);
                 if rank < min_max_rank && rank > max_min_rank {
                     match self.compare(pos, &key) {
-                        Ordering::Less => {
-                            if max_min_rank < rank {
-                                max_min_rank = rank;
-                            }
-                        }
+                        Ordering::Less => max_min_rank = max_min_rank.max(rank),
                         Ordering::Greater => {
-                            if min_max_rank > rank {
-                                min_max_rank = rank;
-                            }
-                            new_metadata = DIMENSION.augment(new_metadata, pos, rank + 1);
+                            min_max_rank = min_max_rank.min(rank);
+                            new_metadata += 1 << (pos * DIMENSION.bit_len);
                         }
                         Ordering::Equal => {
-                            if reserved {
-                                self.metadata
-                                    .fetch_and(!DIMENSION.rank_mask(free_pos), Release);
+                            if reserved_pos != DIMENSION.len {
+                                self.bitmap.fetch_and(!(1 << reserved_pos), Release);
                             }
                             return InsertResult::Duplicate(key, val);
                         }
                     }
-                } else if rank != DIMENSION.removed_rank() && rank > min_max_rank {
-                    new_metadata = DIMENSION.augment(new_metadata, pos, rank + 1);
-                } else if free_pos == DIMENSION.num_entries && rank == Dimension::uninit_rank() {
-                    free_pos = pos;
+                } else if rank > min_max_rank {
+                    new_metadata += 1 << (pos * DIMENSION.bit_len);
                 }
-                mutable_metadata >>= DIMENSION.num_bits_per_entry;
+                mutable_metadata >>= DIMENSION.bit_len;
             }
 
-            if free_pos == DIMENSION.num_entries {
-                return InsertResult::Full(key, val);
-            }
-
-            if !reserved {
-                // Reserve the slot by marking it as removed.
-                let interim_metadata =
-                    DIMENSION.augment(metadata, free_pos, DIMENSION.removed_rank());
-                if let Err(actual) =
-                    self.metadata
-                        .compare_exchange(metadata, interim_metadata, Acquire, Acquire)
+            if reserved_pos == DIMENSION.len {
+                // `Acquire` is needed to synchronize with previous failed insertion attempts.
+                #[allow(clippy::cast_possible_truncation)]
+                if self
+                    .bitmap
+                    .fetch_update(AcqRel, Acquire, |bitmap| {
+                        reserved_pos =
+                            (bitmap | DIMENSION.priority_slot_mask).trailing_ones() as u8;
+                        if reserved_pos == DIMENSION.len {
+                            reserved_pos = bitmap.trailing_ones() as u8;
+                            if reserved_pos == DIMENSION.len {
+                                return None;
+                            }
+                        }
+                        Some(bitmap | (1 << reserved_pos))
+                    })
+                    .is_err()
                 {
-                    free_pos = DIMENSION.num_entries;
-                    metadata = actual;
-                    continue;
+                    return InsertResult::Full(key, val);
                 }
-                metadata = interim_metadata;
 
                 // Write the key and value into the data block.
                 self.data_block.write(
-                    free_pos as usize,
-                    ManuallyDrop::into_inner(take_snapshot(&key)),
-                    ManuallyDrop::into_inner(take_snapshot(&val)),
+                    reserved_pos as usize,
+                    take_snapshot(&key),
+                    take_snapshot(&val),
                 );
-                reserved = true;
             }
 
-            // Finalize the insertion.
-            let final_metadata = DIMENSION.augment(new_metadata, free_pos, max_min_rank + 1);
-            if let Err(actual) =
+            new_metadata |= (max_min_rank as usize + 1) << (reserved_pos * DIMENSION.bit_len);
+            if let Err(current_metadata) =
                 self.metadata
-                    .compare_exchange(metadata, final_metadata, AcqRel, Acquire)
+                    .compare_exchange(metadata, new_metadata, AcqRel, Acquire)
             {
-                metadata = actual;
+                metadata = current_metadata;
                 continue;
             }
 
@@ -709,39 +746,11 @@ where
         if Dimension::is_frozen(metadata) {
             return RemoveResult::Frozen;
         }
-        let mut min_max_rank = DIMENSION.removed_rank();
-        let mut max_min_rank = 0;
-        let mut mutable_metadata = metadata;
-        for pos in 0..DIMENSION.num_entries {
-            if mutable_metadata == 0 {
-                break;
+        if let Some(pos) = self.search_slot(key, metadata) {
+            if condition(self.val(pos)) {
+                return self.remove_unchecked(metadata, pos);
             }
-            let rank = DIMENSION.rank_first(mutable_metadata);
-            if rank < min_max_rank && rank > max_min_rank {
-                match self.compare(pos, key) {
-                    Ordering::Less => {
-                        if max_min_rank < rank {
-                            max_min_rank = rank;
-                        }
-                    }
-                    Ordering::Greater => {
-                        if min_max_rank > rank {
-                            min_max_rank = rank;
-                        }
-                    }
-                    Ordering::Equal => {
-                        // Found the key.
-                        if !condition(self.val(pos)) {
-                            // The given condition is not met.
-                            return RemoveResult::Fail;
-                        }
-                        return self.remove_unchecked(metadata, pos);
-                    }
-                }
-            }
-            mutable_metadata >>= DIMENSION.num_bits_per_entry;
         }
-
         RemoveResult::Fail
     }
 
@@ -754,18 +763,18 @@ where
         Q: Comparable<K> + ?Sized,
     {
         let mut mutable_metadata = self.metadata.load(Acquire) & (!Dimension::state_mask());
-        for pos in 0..DIMENSION.num_entries {
+        for pos in 0..DIMENSION.len {
             if mutable_metadata == 0 {
                 break;
             }
             let rank = DIMENSION.rank_first(mutable_metadata);
-            if rank != Dimension::uninit_rank() && rank != DIMENSION.removed_rank() {
+            if rank != 0 {
                 let k = self.key(pos);
                 if range_contains(range, k) {
                     self.remove_unchecked(self.metadata.load(Acquire), pos);
                 }
             }
-            mutable_metadata >>= DIMENSION.num_bits_per_entry;
+            mutable_metadata >>= DIMENSION.bit_len;
         }
     }
 
@@ -801,11 +810,11 @@ where
         Q: Comparable<K> + ?Sized,
     {
         let metadata = self.metadata.load(Acquire);
-        let mut min_max_rank = DIMENSION.removed_rank();
+        let mut min_max_rank = u8::MAX;
         let mut max_min_rank = 0;
-        let mut min_max_pos = DIMENSION.num_entries;
+        let mut min_max_pos = DIMENSION.len;
         let mut mutable_metadata = metadata;
-        for pos in 0..DIMENSION.num_entries {
+        for pos in 0..DIMENSION.len {
             if mutable_metadata == 0 {
                 break;
             }
@@ -822,41 +831,12 @@ where
                     Ordering::Equal => return (Some(self.val(pos)), metadata),
                 }
             }
-            mutable_metadata >>= DIMENSION.num_bits_per_entry;
+            mutable_metadata >>= DIMENSION.bit_len;
         }
-        if min_max_pos == DIMENSION.num_entries {
-            (None, metadata)
-        } else {
-            (Some(self.val(min_max_pos)), metadata)
-        }
-    }
-
-    /// Iterates over initialized entries.
-    #[inline]
-    pub(crate) fn for_each<E, F: FnMut(u8, u8, Option<(&K, &V)>, bool) -> Result<(), E>>(
-        &self,
-        mut f: F,
-    ) -> Result<usize, E> {
-        let metadata = self.metadata.load(Acquire);
-        let mut mutable_metadata = metadata & (!Dimension::state_mask());
-        for pos in 0..DIMENSION.num_entries {
-            if mutable_metadata == 0 {
-                break;
-            }
-            let rank = DIMENSION.rank_first(mutable_metadata);
-            if rank == Dimension::uninit_rank() {
-                f(pos, rank, None, false)?;
-            } else {
-                let entry = (self.key(pos), self.val(pos));
-                if rank == DIMENSION.removed_rank() {
-                    f(pos, rank, Some(entry), true)?;
-                } else {
-                    f(pos, rank, Some(entry), false)?;
-                }
-            }
-            mutable_metadata >>= DIMENSION.num_bits_per_entry;
-        }
-        Ok(metadata)
+        (
+            (min_max_pos != DIMENSION.len).then(|| self.val(min_max_pos)),
+            metadata,
+        )
     }
 
     /// Searches for a slot in which the key is stored.
@@ -867,9 +847,9 @@ where
         Q: Comparable<K> + ?Sized,
     {
         mutable_metadata &= !Dimension::state_mask();
-        let mut min_max_rank = DIMENSION.removed_rank();
+        let mut min_max_rank = u8::MAX;
         let mut max_min_rank = 0;
-        for pos in 0..DIMENSION.num_entries {
+        for pos in 0..DIMENSION.len {
             if mutable_metadata == 0 {
                 break;
             }
@@ -881,7 +861,7 @@ where
                     Ordering::Equal => return Some(pos),
                 }
             }
-            mutable_metadata >>= DIMENSION.num_bits_per_entry;
+            mutable_metadata >>= DIMENSION.bit_len;
         }
         None
     }
@@ -903,16 +883,23 @@ where
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Array { ")?;
-        let metadata = self.for_each(|i, rank, entry, removed| {
-            if let Some(entry) = entry {
-                write!(f, "{i}: ({rank}, removed: {removed}, {entry:?}), ")?;
-            } else {
-                write!(f, "{i}: (none), ")?;
-            }
-            Ok(())
-        })?;
-        write!(f, "frozen: {}, ", Dimension::is_frozen(metadata))?;
-        write!(f, "retired: {}", Dimension::is_retired(metadata))?;
+        let mut state = (false, false);
+        self.for_each_all(
+            |frozen, retired| {
+                state = (frozen, retired);
+                true
+            },
+            |i, rank, entry, removed| {
+                if let Some(entry) = entry {
+                    write!(f, "{i}: ({rank}, removed: {removed}, {entry:?}), ")?;
+                } else {
+                    write!(f, "{i}: (none), ")?;
+                }
+                Ok(())
+            },
+        )?;
+        write!(f, "frozen: {}, ", state.0)?;
+        write!(f, "retired: {}", state.1)?;
         f.write_str(" }")
     }
 }
@@ -923,20 +910,22 @@ impl<K, V> Drop for Array<K, V> {
         if needs_drop::<(K, V)>() {
             let metadata = self.metadata.load(Acquire);
             let is_frozen = Dimension::is_frozen(metadata);
+            let mut bitmap = self.bitmap.load(Relaxed);
             let mut mutable_metadata = metadata & (!Dimension::state_mask());
-            for pos in 0..DIMENSION.num_entries {
-                if mutable_metadata == 0 {
+            for pos in 0..DIMENSION.len {
+                if mutable_metadata == 0 && bitmap == 0 {
                     break;
                 }
-                let rank = DIMENSION.rank_first(mutable_metadata);
-                if rank != Dimension::uninit_rank()
-                    && (!is_frozen || rank == DIMENSION.removed_rank())
-                {
-                    // `self` being frozen means that reachable values have copied to another
-                    // array, and they should not be dropped here.
-                    self.data_block.drop_in_place(pos as usize);
+                if (bitmap & 1) == 1 {
+                    let rank = DIMENSION.rank_first(mutable_metadata);
+                    if !is_frozen || rank == 0 {
+                        // `self` being frozen means that reachable values have copied to another
+                        // array, and they should not be dropped here.
+                        self.data_block.drop_in_place(pos as usize);
+                    }
                 }
-                mutable_metadata >>= DIMENSION.num_bits_per_entry;
+                bitmap >>= 1;
+                mutable_metadata >>= DIMENSION.bit_len;
             }
         }
     }
@@ -961,12 +950,6 @@ impl Dimension {
         metadata & Self::FROZEN != 0
     }
 
-    /// Updates the metadata to represent a frozen state.
-    #[inline]
-    const fn freeze(metadata: usize) -> usize {
-        metadata | Self::FROZEN
-    }
-
     /// Updates the metadata to represent a non-frozen state.
     #[inline]
     const fn unfreeze(metadata: usize) -> usize {
@@ -979,49 +962,17 @@ impl Dimension {
         metadata & Self::RETIRED != 0
     }
 
-    /// Updates the metadata to represent a retired state.
-    #[inline]
-    const fn retire(metadata: usize) -> usize {
-        metadata | Self::RETIRED
-    }
-
     /// Returns a bit mask for an entry.
     #[inline]
     const fn rank_mask(self, pos: u8) -> usize {
-        ((1_usize << self.num_bits_per_entry) - 1) << (pos * self.num_bits_per_entry)
-    }
-
-    /// Returns the rank of an entry.
-    #[allow(clippy::cast_possible_truncation)]
-    #[inline]
-    const fn rank(self, metadata: usize, pos: u8) -> u8 {
-        ((metadata >> (pos * self.num_bits_per_entry)) % (1_usize << self.num_bits_per_entry)) as u8
+        ((1_usize << self.bit_len) - 1) << (pos * self.bit_len)
     }
 
     /// Returns the rank of the first entry.
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
     const fn rank_first(self, metadata: usize) -> u8 {
-        (metadata % (1_usize << self.num_bits_per_entry)) as u8
-    }
-
-    /// Returns the uninitialized rank value which is smaller than all the valid rank values.
-    #[inline]
-    const fn uninit_rank() -> u8 {
-        0
-    }
-
-    /// Returns the removed rank value which is greater than all the valid rank values.
-    #[allow(clippy::cast_possible_truncation)]
-    #[inline]
-    const fn removed_rank(self) -> u8 {
-        ((1_usize << self.num_bits_per_entry) - 1) as u8
-    }
-
-    /// Augments the rank to the given metadata.
-    #[inline]
-    const fn augment(self, metadata: usize, pos: u8, rank: u8) -> usize {
-        (metadata & (!self.rank_mask(pos))) | ((rank as usize) << (pos * self.num_bits_per_entry))
+        (metadata % (1_usize << self.bit_len)) as u8
     }
 }
 
@@ -1029,34 +980,44 @@ impl Dimension {
 ///
 /// * `M`: The maximum number of entries.
 /// * `B`: The minimum number of bits to express the state of an entry.
-/// * `2`: The number of special states of an entry: uninitialized, removed.
-/// * `3`: The number of special states of an [`Array`]: frozen, and retired.
+/// * `1`: The number of special states of an entry: unreachable.
+/// * `2`: The number of special states of an [`Array`]: frozen, and retired.
 /// * `U`: `usize::BITS`.
-/// * `Eq1 = M + 2 <= 2^B`: `B` bits represent at least `M + 2` states.
+/// * `Eq1 = M + 1 <= 2^B`: `B` bits represent at least `M + 1` states.
 /// * `Eq2 = B * M + 2 <= U`: `M entries + 2` special state.
 /// * `Eq3 = Ceil(Log2(M + 2)) * M + 2 <= U`: derived from `Eq1` and `Eq2`.
 ///
-/// Therefore, when `U = 64 => M = 14 / B = 4`, and `U = 32 => M = 7 / B = 4`.
+/// Therefore, when `U = 64 => M = 15 / B = 4`, and `U = 32 => M = 7 / B = 3`.
 pub const DIMENSION: Dimension = match usize::BITS / 8 {
     1 => Dimension {
-        num_entries: 2,
-        num_bits_per_entry: 2,
+        len: 2,
+        bit_len: 2,
+        priority_slot_mask: 0b11,
+        priority_slot_bit_range: (0, 0),
     },
     2 => Dimension {
-        num_entries: 4,
-        num_bits_per_entry: 3,
+        len: 4,
+        bit_len: 3,
+        priority_slot_mask: 0b1111,
+        priority_slot_bit_range: (0, 0),
     },
     4 => Dimension {
-        num_entries: 7,
-        num_bits_per_entry: 4,
+        len: 7,
+        bit_len: 4, // `3` is sufficient, but `4` is more efficient.
+        priority_slot_mask: 0b111_0001,
+        priority_slot_bit_range: (4, 16),
     },
     8 => Dimension {
-        num_entries: 14,
-        num_bits_per_entry: 4,
+        len: 15,
+        bit_len: 4,
+        priority_slot_mask: 0b111_1111_0000_0001,
+        priority_slot_bit_range: (4, 32),
     },
     _ => Dimension {
-        num_entries: 25,
-        num_bits_per_entry: 5,
+        len: 25,
+        bit_len: 5,
+        priority_slot_mask: 0b1_1111_1111_1111_0000_0000_0001,
+        priority_slot_bit_range: (5, 60),
     },
 };
 
@@ -1112,7 +1073,7 @@ impl Iterator for ArrayIter {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let mut rank = *at(&self.pos, 0) + 1;
-        while rank != DIMENSION.num_entries + 1 {
+        while rank != DIMENSION.len + 1 {
             let pos = *at(&self.pos, rank as usize);
             if pos != u8::MAX {
                 *at_mut(&mut self.pos, 0) = rank;
@@ -1162,18 +1123,17 @@ impl<'l, K, V> Iter<'l, K, V> {
     #[inline]
     pub(super) const fn get(&self) -> Option<(&'l K, &'l V)> {
         let rank = *at(&self.array_iter.pos, 0);
-        if rank == 0 {
-            None
-        } else {
+        if likely(rank != 0) {
             let pos = *at(&self.array_iter.pos, rank as usize);
-            Some((self.leaf.array.key(pos), self.leaf.array.val(pos)))
+            return Some((self.leaf.array.key(pos), self.leaf.array.val(pos)));
         }
+        None
     }
 
     /// Returns a reference to the max key.
     #[inline]
     pub(super) fn max_key(&self) -> Option<&'l K> {
-        let mut rank = DIMENSION.num_entries;
+        let mut rank = DIMENSION.len;
         while rank != 0 {
             let pos = *at(&self.array_iter.pos, rank as usize);
             if pos != u8::MAX {
@@ -1211,7 +1171,7 @@ impl<'l, K, V> Iter<'l, K, V> {
             // Therefore, keys that are smaller than the max key in the current leaf should be
             // filtered out here.
             for (k, v) in self.by_ref() {
-                if !found_unlinked || max_key.is_none_or(|max| max < k) {
+                if likely(!found_unlinked) || max_key.is_none_or(|max| max < k) {
                     return Some((k, v));
                 }
             }
@@ -1295,10 +1255,10 @@ impl Iterator for ArrayRevIter {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let mut rank = *at(&self.pos, 0);
-        if rank == 0 {
-            rank = DIMENSION.num_entries;
-        } else {
+        if likely(rank != 0) {
             rank -= 1;
+        } else {
+            rank = DIMENSION.len;
         }
         while rank != 0 {
             let pos = *at(&self.pos, rank as usize);
@@ -1350,19 +1310,18 @@ impl<'l, K, V> RevIter<'l, K, V> {
     #[inline]
     pub(super) const fn get(&self) -> Option<(&'l K, &'l V)> {
         let rank = *at(&self.array_rev_iter.pos, 0);
-        if rank == 0 {
-            None
-        } else {
+        if likely(rank != 0) {
             let pos = *at(&self.array_rev_iter.pos, rank as usize);
-            Some((self.leaf.array.key(pos), self.leaf.array.val(pos)))
+            return Some((self.leaf.array.key(pos), self.leaf.array.val(pos)));
         }
+        None
     }
 
     /// Returns a reference to the min key entry.
     #[inline]
     pub(super) fn min_key(&self) -> Option<&'l K> {
         let mut rank = 1;
-        while rank != DIMENSION.num_entries + 1 {
+        while rank != DIMENSION.len + 1 {
             let pos = *at(&self.array_rev_iter.pos, rank as usize);
             if pos != u8::MAX {
                 return Some(self.leaf.key(pos));
@@ -1392,7 +1351,7 @@ impl<'l, K, V> RevIter<'l, K, V> {
 
             // See `Iter::jump`.
             for (k, v) in self.by_ref() {
-                if !found_unlinked || min_key.is_none_or(|min| min > k) {
+                if likely(!found_unlinked) || min_key.is_none_or(|min| min > k) {
                     return Some((k, v));
                 }
             }
@@ -1439,11 +1398,13 @@ const fn at_mut<T>(array: &mut [T], index: usize) -> &mut T {
 #[cfg(not(feature = "loom"))]
 #[cfg(test)]
 mod test {
-    use super::*;
-    use proptest::prelude::*;
-    use sdd::Shared;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    use proptest::prelude::*;
     use tokio::sync::Barrier;
+
+    use super::*;
 
     #[test]
     fn array() {
@@ -1459,9 +1420,9 @@ mod test {
         assert_eq!(array.search_entry("MY GOODNESS!").unwrap().1, "OH MY GOD!!");
         assert_eq!(array.search_entry("GOOD DAY").unwrap().1, "OH MY GOD!!");
 
-        for pos in 0..DIMENSION.num_entries {
+        for pos in 0..DIMENSION.len {
             if let InsertResult::Full(k, v) = array.insert(pos.to_string(), pos.to_string()) {
-                assert_eq!(pos + 2, DIMENSION.num_entries);
+                assert_eq!(pos + 2, DIMENSION.len);
                 assert_eq!(k, pos.to_string());
                 assert_eq!(v, pos.to_string());
                 break;
@@ -1472,9 +1433,9 @@ mod test {
             );
         }
 
-        for pos in 0..DIMENSION.num_entries {
+        for pos in 0..DIMENSION.len {
             let result = array.remove_if(&pos.to_string(), &mut |_| pos >= 10);
-            if pos >= 10 && pos + 2 < DIMENSION.num_entries {
+            if pos >= 10 && pos + 2 < DIMENSION.len {
                 assert_eq!(result, RemoveResult::Success);
             } else {
                 assert_eq!(result, RemoveResult::Fail);
@@ -1506,7 +1467,7 @@ mod test {
         ));
 
         let mut iter = ArrayIter::new(&array);
-        for pos in 0..DIMENSION.num_entries {
+        for pos in 0..DIMENSION.len {
             if let Some(e) = iter.next() {
                 assert_eq!(array.key(e), &pos.to_string());
                 assert_eq!(array.val(e), &pos.to_string());
@@ -1528,7 +1489,7 @@ mod test {
     #[test]
     fn iter_rev_iter() {
         let leaf: Leaf<usize, usize> = Leaf::new();
-        for pos in 0..DIMENSION.num_entries as usize {
+        for pos in 0..DIMENSION.len as usize {
             if pos % 2 == 0 {
                 assert!(matches!(
                     leaf.insert(pos * 1024 + 1, pos),
@@ -1572,26 +1533,26 @@ mod test {
     #[test]
     fn calculate_boundary() {
         let leaf: Leaf<usize, usize> = Leaf::new();
-        for i in 0..DIMENSION.num_entries as usize {
+        for i in 0..DIMENSION.len as usize {
             assert!(matches!(leaf.insert(i, i), InsertResult::Success));
         }
         assert_eq!(
             Array::<usize, usize>::optimal_boundary(leaf.metadata.load(Relaxed)),
-            (DIMENSION.num_entries - 1, DIMENSION.num_entries as usize)
+            (DIMENSION.len - 1, DIMENSION.len as usize)
         );
 
         let leaf: Leaf<usize, usize> = Leaf::new();
-        for i in (0..DIMENSION.num_entries as usize).rev() {
+        for i in (0..DIMENSION.len as usize).rev() {
             assert!(matches!(leaf.insert(i, i), InsertResult::Success));
         }
         assert_eq!(
             Array::<usize, usize>::optimal_boundary(leaf.metadata.load(Relaxed)),
-            (1, DIMENSION.num_entries as usize)
+            (1, DIMENSION.len as usize)
         );
 
         let leaf: Leaf<usize, usize> = Leaf::new();
-        for i in 0..DIMENSION.num_entries as usize {
-            if i < DIMENSION.num_entries as usize / 2 {
+        for i in 0..DIMENSION.len as usize {
+            if i < DIMENSION.len as usize / 2 {
                 assert!(matches!(
                     leaf.insert(usize::MAX - i, usize::MAX - i),
                     InsertResult::Success
@@ -1603,12 +1564,12 @@ mod test {
         if usize::BITS == 32 {
             assert_eq!(
                 Array::<usize, usize>::optimal_boundary(leaf.metadata.load(Relaxed)),
-                (4, DIMENSION.num_entries as usize)
+                (4, DIMENSION.len as usize)
             );
         } else {
             assert_eq!(
                 Array::<usize, usize>::optimal_boundary(leaf.metadata.load(Relaxed)),
-                (6, DIMENSION.num_entries as usize)
+                (8, DIMENSION.len as usize)
             );
         }
     }
@@ -1623,7 +1584,7 @@ mod test {
         leaf1.freeze();
         let leaf2 = Leaf::new();
         leaf2.freeze();
-        assert!(leaf.freeze());
+        leaf.freeze();
         let mut i = 0;
         leaf.distribute(
             |_, _| true,
@@ -1645,10 +1606,37 @@ mod test {
         assert_eq!(leaf.remove_if(&17, &mut |_| true), RemoveResult::Frozen);
         assert!(matches!(leaf.insert(3, 5), InsertResult::Full(..)));
 
-        assert!(leaf.unfreeze());
+        leaf.unfreeze();
         assert!(matches!(leaf.insert(1, 7), InsertResult::Success));
 
         assert_eq!(leaf.remove_if(&1, &mut |_| true), RemoveResult::Success);
+
+        let mut invalid = 0;
+        let mut valid = 0;
+        assert!(
+            leaf.for_each_all(
+                |frozen, retired| {
+                    assert!(!frozen && !retired);
+                    true
+                },
+                |_, _, entry, removed| -> Result<(), ()> {
+                    if removed {
+                        assert_eq!(*entry.unwrap().0, 1);
+                        assert_eq!(*entry.unwrap().1, 7);
+                        invalid += 1;
+                    } else if let Some((k, v)) = entry {
+                        assert!(*k == 11 || *k == 17);
+                        assert!(*v == 11 || *v == 17);
+                        valid += 1;
+                    }
+                    Ok(())
+                }
+            )
+            .is_ok()
+        );
+        assert_eq!(invalid, 1);
+        assert_eq!(valid, 2);
+
         assert_eq!(leaf.remove_if(&17, &mut |_| true), RemoveResult::Success);
         assert_eq!(leaf.remove_if(&11, &mut |_| true), RemoveResult::Retired);
 
@@ -1658,7 +1646,7 @@ mod test {
     proptest! {
         #[cfg_attr(miri, ignore)]
         #[test]
-        fn general(insert in 0_usize..DIMENSION.num_entries as usize, remove in 0_usize..DIMENSION.num_entries as usize) {
+        fn general(insert in 0_usize..DIMENSION.len as usize, remove in 0_usize..DIMENSION.len as usize) {
             let array: Array<usize, usize> = Array::new();
             assert!(array.is_empty());
             for i in 0..insert {
@@ -1674,7 +1662,7 @@ mod test {
             for i in 0..insert {
                 assert_eq!(array.search_entry(&i).unwrap(), (&i, &i));
             }
-            if insert == DIMENSION.num_entries as usize {
+            if insert == DIMENSION.len as usize {
                 assert!(matches!(array.insert(usize::MAX, usize::MAX), InsertResult::Full(..)));
             }
             for i in 0..remove {
@@ -1696,17 +1684,17 @@ mod test {
 
         #[cfg_attr(miri, ignore)]
         #[test]
-        fn range(start in 0_usize..DIMENSION.num_entries as usize, end in 0_usize..DIMENSION.num_entries as usize) {
+        fn range(start in 0_usize..DIMENSION.len as usize, end in 0_usize..DIMENSION.len as usize) {
             let array: Array<usize, usize> = Array::new();
-            for i in 1..DIMENSION.num_entries as usize - 1 {
+            for i in 1..DIMENSION.len as usize - 1 {
                 prop_assert!(matches!(array.insert(i, i), InsertResult::Success));
             }
             array.remove_range(&(start..end));
-            for i in 1..DIMENSION.num_entries as usize - 1 {
+            for i in 1..DIMENSION.len as usize - 1 {
                 prop_assert!(array.search_entry(&i).is_none() == (start..end).contains(&i));
             }
             prop_assert!(array.search_entry(&0).is_none());
-            prop_assert!(array.search_entry(&(DIMENSION.num_entries as usize - 1)).is_none());
+            prop_assert!(array.search_entry(&(DIMENSION.len as usize - 1)).is_none());
         }
     }
 
@@ -1714,12 +1702,12 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn update() {
         let num_excess = 3;
-        let num_tasks = DIMENSION.num_entries as usize + num_excess;
+        let num_tasks = DIMENSION.len as usize + num_excess;
         for _ in 0..256 {
-            let barrier = Shared::new(Barrier::new(num_tasks));
-            let leaf: Shared<Leaf<usize, usize>> = Shared::new(Leaf::new());
-            let full: Shared<AtomicUsize> = Shared::new(AtomicUsize::new(0));
-            let retire: Shared<AtomicUsize> = Shared::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(num_tasks));
+            let leaf: Arc<Leaf<usize, usize>> = Arc::new(Leaf::new());
+            let full: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+            let retire: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
             let mut task_handles = Vec::with_capacity(num_tasks);
             for t in 1..=num_tasks {
                 let barrier_clone = barrier.clone();
@@ -1760,7 +1748,7 @@ mod test {
                     }
                     {
                         let iter = Iter::new(&leaf_clone);
-                        assert_eq!(iter.count(), DIMENSION.num_entries as usize);
+                        assert_eq!(iter.count(), DIMENSION.len as usize);
                     }
 
                     barrier_clone.wait().await;
@@ -1788,9 +1776,9 @@ mod test {
         let workload_size = 8_usize;
         for _ in 0..16 {
             for k in 0..=workload_size {
-                let barrier = Shared::new(Barrier::new(num_tasks));
-                let leaf: Shared<Leaf<usize, usize>> = Shared::new(Leaf::new());
-                let inserted: Shared<AtomicBool> = Shared::new(AtomicBool::new(false));
+                let barrier = Arc::new(Barrier::new(num_tasks));
+                let leaf: Arc<Leaf<usize, usize>> = Arc::new(Leaf::new());
+                let inserted: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
                 let mut task_handles = Vec::with_capacity(num_tasks);
                 for _ in 0..num_tasks {
                     let barrier_clone = barrier.clone();

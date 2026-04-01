@@ -1,7 +1,9 @@
-use core::marker::Destruct;
-use core::{cmp, fmt};
-use core::ops::{ControlFlow, Deref, DerefMut};
-use core::hash::{Hash, Hasher};
+use core::{
+    cmp, fmt,
+    hash::{Hash, Hasher},
+    marker::Destruct,
+    ops::{Deref, DerefMut},
+};
 
 #[repr(transparent)]
 pub struct Bytes<B>(pub B);
@@ -40,22 +42,6 @@ impl<B: [const] PartialOrd> const PartialOrd for Bytes<B> {
     fn gt(&self, other: &Bytes<B>) -> bool { PartialOrd::gt(&self.0, &other.0) }
     #[inline]
     fn ge(&self, other: &Bytes<B>) -> bool { PartialOrd::ge(&self.0, &other.0) }
-    #[inline]
-    fn __chaining_lt(&self, other: &Bytes<B>) -> ControlFlow<bool> {
-        PartialOrd::__chaining_lt(&self.0, &other.0)
-    }
-    #[inline]
-    fn __chaining_le(&self, other: &Bytes<B>) -> ControlFlow<bool> {
-        PartialOrd::__chaining_le(&self.0, &other.0)
-    }
-    #[inline]
-    fn __chaining_gt(&self, other: &Bytes<B>) -> ControlFlow<bool> {
-        PartialOrd::__chaining_gt(&self.0, &other.0)
-    }
-    #[inline]
-    fn __chaining_ge(&self, other: &Bytes<B>) -> ControlFlow<bool> {
-        PartialOrd::__chaining_ge(&self.0, &other.0)
-    }
 }
 
 impl<B: [const] Ord + [const] Destruct> const Ord for Bytes<B> {
@@ -83,9 +69,7 @@ impl<B: Hash> Hash for Bytes<B> {
     fn hash<H: Hasher>(&self, state: &mut H) { self.0.hash(state) }
     #[inline]
     fn hash_slice<H: Hasher>(data: &[Self], state: &mut H)
-    where
-        B: Sized,
-    {
+    where B: Sized {
         B::hash_slice(Self::slice_ref(data), state)
     }
 }
@@ -111,28 +95,20 @@ impl<B> DerefMut for Bytes<B> {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
 }
 
-#[cfg(feature = "bytes")]
-impl const From<::bytes::Bytes> for Bytes<::bytes::Bytes> {
+impl<B> const From<B> for Bytes<B> {
     #[inline]
-    fn from(value: ::bytes::Bytes) -> Self { Self(value) }
-}
-
-#[cfg(feature = "alloc")]
-impl const From<::alloc::vec::Vec<u8>> for Bytes<::alloc::vec::Vec<u8>> {
-    #[inline]
-    fn from(value: ::alloc::vec::Vec<u8>) -> Self { Self(value) }
+    fn from(value: B) -> Self { Self(value) }
 }
 
 #[cfg(feature = "serde")]
 mod serde_impls {
-    use core::marker::PhantomData;
-    use core::fmt;
-
-    use base64_simd::{forgiving_decode_to_vec, STANDARD};
-    use serde_core::{Deserialize, Deserializer, Serialize, Serializer};
-    use serde_core::de::{self, Unexpected, Visitor};
-
     use super::Bytes;
+    use base64_simd::{STANDARD, forgiving_decode_to_vec};
+    use core::marker::PhantomData;
+    use serde_core::{
+        Deserialize, Deserializer, Serialize, Serializer,
+        de::{self, Unexpected, Visitor},
+    };
 
     impl<B: AsRef<[u8]>> Serialize for Bytes<B> {
         #[inline]
@@ -142,7 +118,6 @@ mod serde_impls {
         }
     }
 
-    #[cfg(feature = "alloc")]
     impl<'de, B: From<::alloc::vec::Vec<u8>>> Deserialize<'de> for Bytes<B> {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where D: Deserializer<'de> {
@@ -151,7 +126,7 @@ mod serde_impls {
             impl<'de, B: From<::alloc::vec::Vec<u8>>> Visitor<'de> for BytesVisitor<B> {
                 type Value = Bytes<B>;
 
-                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
                     f.write_str("a Base64 encoded string")
                 }
 

@@ -103,10 +103,10 @@ pub static PRI_REVERSE_PROXY_HOST: ManuallyInit<Cow<'static, str>> = ManuallyIni
 pub static PUB_REVERSE_PROXY_HOST: ManuallyInit<Cow<'static, str>> = ManuallyInit::new();
 
 pub fn pri_reverse_proxy_host() -> http::header::HeaderValue {
-    unsafe { HeaderValue::from_bytes(PRI_REVERSE_PROXY_HOST.get().as_bytes()).into() }
+    unsafe { HeaderValue::from_static(PRI_REVERSE_PROXY_HOST.get()).into() }
 }
 pub fn pub_reverse_proxy_host() -> http::header::HeaderValue {
-    unsafe { HeaderValue::from_bytes(PUB_REVERSE_PROXY_HOST.get().as_bytes()).into() }
+    unsafe { HeaderValue::from_static(PUB_REVERSE_PROXY_HOST.get()).into() }
 }
 
 const DEFAULT_KEY_PREFIX: &str = "sk-";
@@ -195,6 +195,7 @@ def_cursor_api_url! {
         host: CURSOR_API2_HOST,
         apis: [
             chat_url => "/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
+            // agent_url => "/agent.v1.AgentService/Run",
             chat_models_url => "/aiserver.v1.AiService/AvailableModels",
             stripe_url => "/auth/full_stripe_profile",
             token_poll_url => "/auth/poll",

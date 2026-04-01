@@ -353,7 +353,7 @@ impl Response {
     /// This requires the optional `stream` feature to be enabled.
     #[cfg(feature = "stream")]
     #[cfg_attr(docsrs, doc(cfg(feature = "stream")))]
-    pub fn bytes_stream(self) -> impl futures_core::Stream<Item = crate::Result<Bytes>> {
+    pub fn bytes_stream(self) -> http_body_util::BodyDataStream<http_body_util::combinators::MapErr<http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync + 'static>>, fn(Box<dyn std::error::Error + Send + Sync>) -> crate::Error>> {
         http_body_util::BodyDataStream::new(self.res.into_body().map_err(crate::error::decode))
     }
 

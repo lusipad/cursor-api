@@ -6,6 +6,7 @@ use crate::app::{
     model::{Alias, ExtToken, TokenInfo, TokenInfoHelper, TokenKey},
 };
 use alloc::{borrow::Cow, collections::VecDeque};
+use core::mem::{MaybeUninit, replace};
 use memmap2::{Mmap, MmapMut};
 pub use queue::{QueueType, TokenHealth, TokenQueue};
 use tokio::fs::OpenOptions;
@@ -50,7 +51,7 @@ impl core::error::Error for TokenError {}
 /// 性能关键路径已使用unsafe消除边界检查
 pub struct TokenManager {
     /// 主存储：ID -> TokenInfo，使用Option支持删除后的空槽位
-    tokens: Vec<Option<TokenInfo>>,
+    tokens: Vec<MaybeUninit<TokenInfo>>,
     /// TokenKey -> ID映射，用于通过token内容查找
     id_map: HashMap<TokenKey, usize>,
     /// 别名 -> ID映射，用于用户友好的查找
@@ -99,7 +100,7 @@ impl TokenManager {
             reused_id
         } else {
             let new_id = self.tokens.len();
-            self.tokens.push(None);
+            self.tokens.push(MaybeUninit::uninit());
             self.id_to_alias.push(None);
             new_id
         };
@@ -109,7 +110,7 @@ impl TokenManager {
         self.queue.push(key, id);
 
         // SAFETY: id要么是reused_id（来自free_ids，必定<len），要么是刚push后的新索引
-        unsafe { *self.tokens.get_unchecked_mut(id) = Some(token_info) };
+        unsafe { *self.tokens.get_unchecked_mut(id) = MaybeUninit::new(token_info) };
 
         let alias = Alias::new(alias);
         self.alias_map.insert(alias.clone(), id);
@@ -124,7 +125,8 @@ impl TokenManager {
     /// 热路径：通过ID查询Token
     #[inline]
     pub fn get_by_id(&self, id: usize) -> Option<&TokenInfo> {
-        self.tokens.get(id).and_then(|o| o.as_ref())
+        self.contains_id(id)?;
+        Some(unsafe { self.tokens.get_unchecked(id).assume_init_ref() })
     }
 
     /// 热路径：通过别名查询Token
@@ -132,18 +134,21 @@ impl TokenManager {
     pub fn get_by_alias(&self, alias: &str) -> Option<&TokenInfo> {
         let &id = self.alias_map.get(alias)?;
         // SAFETY: alias_map中的id由add/remove维护，保证<tokens.len()且对应Some
-        Some(unsafe { self.tokens.get_unchecked(id).as_ref().unwrap_unchecked() })
+        Some(unsafe { self.tokens.get_unchecked(id).assume_init_ref() })
     }
 
     #[inline(never)]
     pub fn remove(&mut self, id: usize) -> Option<TokenInfo> {
-        let token_info = self.tokens.get_mut(id)?.take()?;
+        self.contains_id(id)?;
+        let token_info = unsafe {
+            replace(self.tokens.get_unchecked_mut(id), MaybeUninit::uninit()).assume_init()
+        };
 
         // 清理所有索引
         let key = token_info.bundle.primary_token.key();
         self.id_map.remove(&key);
         #[cfg(not(feature = "horizon"))]
-        self.queue.remove(&queue);
+        self.queue.remove(&key);
         #[cfg(feature = "horizon")]
         self.queue.remove(&key, &self.tokens);
 
@@ -164,7 +169,7 @@ impl TokenManager {
         id: usize,
         alias: S,
     ) -> Result<(), TokenError> {
-        if self.tokens.get(id).is_none_or(Option::is_none) {
+        if self.contains_id(id).is_none() {
             return Err(TokenError::InvalidId);
         }
 
@@ -191,7 +196,14 @@ impl TokenManager {
         Ok(())
     }
 
-    pub fn tokens(&self) -> &Vec<Option<TokenInfo>> { &self.tokens }
+    pub fn valid_tokens(&self) -> impl Iterator<Item = &TokenInfo> {
+        self.id_to_alias
+            .iter()
+            .zip(self.tokens.iter())
+            .flat_map(|(a, i)| a.as_ref().map(|_| unsafe { i.assume_init_ref() }))
+    }
+
+    pub const fn tokens_len(&self) -> usize { self.tokens.len() }
 
     pub fn tokens_mut(&mut self) -> TokensWriter<'_> {
         TokensWriter { tokens: &mut self.tokens, id_map: &mut self.id_map, queue: &mut self.queue }
@@ -209,25 +221,23 @@ impl TokenManager {
 
     #[inline(never)]
     pub fn list(&self) -> Vec<(usize, Alias, TokenInfo)> {
-        // SAFETY: enumerate保证id<len，filter_map只处理Some分支，id_to_alias同步维护
-        unsafe {
-            self.tokens
-                .iter()
-                .enumerate()
-                .filter_map(|(id, token_opt)| {
-                    token_opt.as_ref().map(|token| {
-                        let alias = self.id_to_alias.get_unchecked(id).as_ref().unwrap_unchecked();
-                        (id, alias.clone(), token.clone())
-                    })
+        self.id_to_alias
+            .iter()
+            .enumerate()
+            .filter_map(|(id, alias_opt)| {
+                alias_opt.as_ref().map(|alias| {
+                    // SAFETY: enumerate保证id<len，filter_map只处理Some分支，id_to_alias同步维护
+                    let token = unsafe { self.tokens.get_unchecked(id).assume_init_ref() };
+                    (id, alias.clone(), token.clone())
                 })
-                .collect()
-        }
+            })
+            .collect()
     }
 
     /// 更新所有token的客户端密钥，用于安全性刷新
     #[inline(always)]
     pub fn update_client_key(&mut self) {
-        for token_info in self.tokens.iter_mut().flatten() {
+        for token_info in self.valid_tokens_mut() {
             token_info.bundle.client_key = super::super::Hash::random();
             token_info.bundle.session_id = uuid::Uuid::new_v4();
         }
@@ -236,24 +246,19 @@ impl TokenManager {
     #[inline(never)]
     pub async fn save(&self) -> Result<(), Box<dyn core::error::Error + Send + Sync + 'static>> {
         // SAFETY: enumerate保证id<len，filter_map只处理Some，id_to_alias同步维护
-        let helpers: Vec<TokenInfoHelper> = unsafe {
-            self.tokens
-                .iter()
-                .enumerate()
-                .filter_map(|(id, token_opt)| {
-                    token_opt.as_ref().map(|token_info| {
-                        let alias = self
-                            .id_to_alias
-                            .get_unchecked(id)
-                            .as_ref()
-                            .map(|a| a.to_string())
-                            .unwrap_unchecked();
+        let helpers: Vec<TokenInfoHelper> = self
+            .id_to_alias
+            .iter()
+            .zip(self.tokens.iter())
+            .filter_map(|(alias_opt, token_opt)| {
+                alias_opt.as_ref().map(|alias| {
+                    let alias = alias.clone().into_inner();
+                    let token_info = unsafe { token_opt.assume_init_ref() };
 
-                        TokenInfoHelper::new(token_info, alias)
-                    })
+                    TokenInfoHelper::new(token_info, alias)
                 })
-                .collect()
-        };
+            })
+            .collect();
 
         let bytes = ::rkyv::to_bytes::<::rkyv::rancor::Error>(&helpers)?;
         if bytes.len() > usize::MAX >> 1 {
@@ -299,15 +304,27 @@ impl TokenManager {
 
         for helper in helpers {
             let (token_info, alias) = helper.extract();
-            let _ = manager.add(token_info, alias)?;
+            let _ = manager.add(token_info, &*alias)?;
         }
 
         Ok(manager)
     }
+
+    #[must_use]
+    fn contains_id(&self, id: usize) -> Option<()> {
+        self.id_to_alias.get(id)?.as_ref().map(|_| ())
+    }
+
+    fn valid_tokens_mut(&mut self) -> impl Iterator<Item = &mut TokenInfo> {
+        self.id_to_alias
+            .iter()
+            .zip(self.tokens.iter_mut())
+            .flat_map(|(a, i)| a.as_ref().map(|_| unsafe { i.assume_init_mut() }))
+    }
 }
 
 pub struct TokensWriter<'w> {
-    tokens: &'w mut Vec<Option<TokenInfo>>,
+    tokens: &'w mut Vec<MaybeUninit<TokenInfo>>,
     id_map: &'w mut HashMap<TokenKey, usize>,
     queue: &'w mut TokenQueue,
 }
@@ -316,14 +333,13 @@ impl<'w> TokensWriter<'w> {
     // SAFETY: 调用者必须保证id < tokens.len()且tokens[id].is_some()
     #[inline]
     pub unsafe fn get_unchecked_mut(self, id: usize) -> &'w mut TokenInfo {
-        unsafe { self.tokens.get_unchecked_mut(id).as_mut().unwrap_unchecked() }
+        unsafe { self.tokens.get_unchecked_mut(id).assume_init_mut() }
     }
 
     // SAFETY: 调用者必须保证id < tokens.len()且tokens[id].is_some()
     #[inline]
     pub unsafe fn into_token_writer(self, id: usize) -> TokenWriter<'w> {
-        let token =
-            unsafe { &mut self.tokens.get_unchecked_mut(id).as_mut().unwrap_unchecked().bundle };
+        let token = unsafe { &mut self.tokens.get_unchecked_mut(id).assume_init_mut().bundle };
         TokenWriter {
             key: token.primary_token.key(),
             token,
@@ -365,7 +381,9 @@ impl Drop for TokenWriter<'_> {
             // SAFETY: TokenWriter只能通过into_token_writer创建，那时token必存在
             // self.key是创建时的token key，必在id_map中
             unsafe {
-                let i = if let hashbrown::hash_map::EntryRef::Occupied(entry) = self.id_map.entry_ref(&self.key) {
+                let i = if let hashbrown::hash_map::EntryRef::Occupied(entry) =
+                    self.id_map.entry_ref(&self.key)
+                {
                     entry.remove()
                 } else {
                     unreachable_unchecked()
@@ -384,23 +402,11 @@ fn generate_unnamed_alias(id: usize) -> String {
     // 预分配容量：pattern长度 + 6位数字
     // 6位数字可表示0-999999，覆盖百万级token
     // 超过百万时String会自动扩容（额外一次realloc）
-    const CAPACITY: usize = UNNAMED_PATTERN.len() + 6;
+    const CAPACITY: usize = (UNNAMED_PATTERN.len() + 6).next_power_of_two();
     let mut s = String::with_capacity(CAPACITY);
     s.push_str(UNNAMED_PATTERN);
 
-    if id == 0 {
-        s.push('0');
-    } else {
-        let start = s.len();
-        let mut n = id;
-        // 倒序push数字，最后反转
-        while n > 0 {
-            s.push((b'0' + (n % 10) as u8) as char);
-            n /= 10;
-        }
-        // SAFETY: 只push了ASCII数字，UTF-8有效
-        unsafe { s[start..].as_bytes_mut().reverse() };
-    }
+    s.push_str(itoa::Buffer::new().format(id));
 
     s
 }

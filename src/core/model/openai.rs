@@ -1,4 +1,4 @@
-use super::{IndexMap, Role};
+use super::{JsonObject, Role};
 use crate::{
     app::constant::{ERROR, TYPE},
     common::{
@@ -66,7 +66,7 @@ pub enum ChatCompletionContentPart {
     ImageUrl { image_url: ImageUrl },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum ChatCompletionContentText {
     String(String),
@@ -157,7 +157,7 @@ pub struct FunctionDefinition {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub parameters: IndexMap<String, serde_json::Value>,
+    pub parameters: JsonObject,
 }
 
 #[derive(Serialize, Deserialize)]

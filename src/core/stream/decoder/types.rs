@@ -48,7 +48,7 @@ pub(crate) enum DecoderError {
     GzipDecompressionFailed,
 
     /// JSON payload cannot be parsed into the expected error type.
-    CursorErrorJsonDecodeFailed { source: serde_json::Error },
+    CursorErrorJsonDecodeFailed { source: sonic_rs::Error },
 
     /// Protobuf payload cannot be decoded.
     ProtobufDecodeFailed { source: prost::DecodeError },

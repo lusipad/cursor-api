@@ -1,17 +1,19 @@
+use std::convert::AsRef;
 use std::fmt;
 use std::ops::RangeBounds;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 
-use sdd::{AtomicShared, Ptr, Shared, Tag};
+use sdd::{AtomicRaw, Owned, RawPtr};
 
 use super::internal_node::InternalNode;
 use super::internal_node::Locker as InternalNodeLocker;
 use super::leaf::{InsertResult, Iter, Leaf, RemoveResult, RevIter};
 use super::leaf_node::LeafNode;
-use crate::utils::{LockPager, deref_unchecked, drop_in_place};
+use crate::utils::{LockPager, deref_unchecked, get_owned};
 use crate::{Comparable, Guard};
 
 /// [`Node`] is either [`Self::Internal`] or [`Self::Leaf`].
+#[repr(align(64))]
 pub enum Node<K, V> {
     /// Internal node.
     Internal(InternalNode<K, V>),
@@ -232,29 +234,36 @@ where
     }
 
     /// Splits the current root node.
-    #[inline]
     pub(super) fn split_root(
-        root_ptr: Ptr<Node<K, V>>,
-        root: &AtomicShared<Node<K, V>>,
+        root_ptr: RawPtr<Node<K, V>>,
+        root: &AtomicRaw<Node<K, V>>,
         guard: &Guard,
     ) {
-        if let Some(old_root) = root_ptr.get_shared() {
+        if let Some(old_root) = deref_unchecked(root_ptr) {
             let new_root = if old_root.is_retired() {
-                Some(Shared::new_with(Node::new_leaf_node))
+                Owned::new_with(Node::new_leaf_node)
             } else {
-                let internal_node = Shared::new_with(Node::new_internal_node);
+                let internal_node = Owned::new_with(Node::new_internal_node);
                 let Node::Internal(node) = internal_node.as_ref() else {
                     return;
                 };
-                node.unbounded_child
-                    .swap((Some(old_root), Tag::None), Relaxed);
-                Some(internal_node)
+                node.unbounded_child.store(root_ptr, Relaxed);
+                internal_node
             };
             // Updates the pointer before unlocking the root.
-            if let Err((Some(new_root), _)) =
-                root.compare_exchange(root_ptr, (new_root, Tag::None), AcqRel, Acquire, guard)
+            let new_root_ptr = new_root.into_raw();
+            if root
+                .compare_exchange(root_ptr, new_root_ptr, Release, Relaxed, guard)
+                .is_err()
             {
-                drop_in_place(new_root);
+                if let Some(Node::Internal(new_internal_node)) =
+                    get_owned(new_root_ptr).as_ref().map(AsRef::as_ref)
+                {
+                    // Reset the pointer to prevent double-free.
+                    new_internal_node
+                        .unbounded_child
+                        .store(RawPtr::null(), Relaxed);
+                }
             }
         }
     }
@@ -265,27 +274,27 @@ where
     /// child, the root is replaced with the child.
     ///
     /// Returns `false` if a conflict is detected.
-    #[inline]
     pub(super) fn cleanup_root<P: LockPager>(
-        root: &AtomicShared<Node<K, V>>,
+        root: &AtomicRaw<Node<K, V>>,
         pager: &mut P,
         guard: &Guard,
     ) -> bool {
         let mut root_ptr = root.load(Acquire, guard);
         while let Some(root_ref) = deref_unchecked(root_ptr) {
             if root_ref.is_retired() {
-                if let Err((_, new_root_ptr)) =
-                    root.compare_exchange(root_ptr, (None, Tag::None), AcqRel, Acquire, guard)
+                if let Err(new_root_ptr) =
+                    root.compare_exchange(root_ptr, RawPtr::null(), AcqRel, Acquire, guard)
                 {
                     root_ptr = new_root_ptr;
                     continue;
                 }
                 // The entire tree was truncated.
+                drop(get_owned(root_ptr));
                 break;
             }
 
             // Try to lower the tree.
-            let Self::Internal(internal_node) = root_ref else {
+            let Node::Internal(internal_node) = root_ref else {
                 break;
             };
 
@@ -305,19 +314,20 @@ where
                 Err(()) => return false,
             };
 
-            let new_root = if internal_node.children.is_empty() {
+            let new_root_ptr = if internal_node.children.is_empty() {
                 // Replace the root with the unbounded child.
-                internal_node.unbounded_child.get_shared(Acquire, guard)
+                internal_node.unbounded_child.load(Acquire, guard)
             } else {
                 // The internal node is not empty.
                 break;
             };
-            match root.compare_exchange(root_ptr, (new_root, Tag::None), AcqRel, Acquire, guard) {
-                Ok((_, new_root_ptr)) => {
+            match root.compare_exchange(root_ptr, new_root_ptr, AcqRel, Acquire, guard) {
+                Ok(_) => {
                     locker.unlock_retire();
                     root_ptr = new_root_ptr;
+                    guard.accelerate();
                 }
-                Err((_, new_root_ptr)) => {
+                Err(new_root_ptr) => {
                     // The root node has been changed.
                     root_ptr = new_root_ptr;
                 }

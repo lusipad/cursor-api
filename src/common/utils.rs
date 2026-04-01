@@ -51,12 +51,13 @@ use alloc::borrow::Cow;
 pub use base64::{from_base64, to_base64};
 use base64_simd::{Out, URL_SAFE_NO_PAD};
 use core::{sync::atomic::Ordering, time::Duration};
-pub use hex::hex_to_byte;
 use interned::ArcStr;
 use prost::Message as _;
 pub use proto_encode::{encode_message, encode_message_framed};
 use rep_move::RepMove;
 use reqwest::Client;
+#[cfg(not(feature = "__perf"))]
+use serde_json as sonic_rs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub trait ParseFromEnv: Sized + 'static {
@@ -185,6 +186,49 @@ impl ParseFromEnv for duration_fmt::Language {
             "random" => Self::Random,
             _ => return None,
         })
+    }
+}
+
+impl ParseFromEnv for ::core::time::Duration {
+    fn parse_from_env(key: &str) -> Option<Self> {
+        let mut raw = ::std::env::var(key).ok()?;
+
+        let (trim_start, trim_len, unit_rel) = {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let start = trimmed.as_ptr() as usize - raw.as_ptr() as usize;
+            let unit_rel = trimmed
+                .find(|c: char| c.is_ascii_alphabetic() || c == 'µ')
+                .unwrap_or(trimmed.len());
+            (start, trimmed.len(), unit_rel)
+        };
+
+        let abs_end = trim_start + trim_len;
+
+        // SAFETY: 只对单位部分（ASCII 字母）做小写，保持 UTF-8 有效性
+        // µ 是多字节但 make_ascii_lowercase 不动非 ASCII 字节
+        unsafe { raw.as_bytes_mut()[trim_start + unit_rel..abs_end].make_ascii_lowercase() }
+
+        let s = &raw[trim_start..abs_end];
+        let num_str = s[..unit_rel].trim_end();
+        let unit = s[unit_rel..].trim_start();
+
+        let n: f64 = num_str.parse().ok()?;
+
+        let total_secs = match unit {
+            "ns" | "nanos" => n * 1e-9,
+            "us" | "µs" | "micros" => n * 1e-6,
+            "ms" | "millis" => n * 1e-3,
+            "s" | "sec" | "secs" | "" => n,
+            "m" | "min" | "mins" => n * 60.0,
+            "h" | "hr" | "hrs" => n * 3600.0,
+            "d" | "day" | "days" => n * 86400.0,
+            _ => return None,
+        };
+
+        Duration::try_from_secs_f64(total_secs).ok()
     }
 }
 
@@ -322,7 +366,7 @@ pub async fn get_stripe_profile(
     // crate::debug!("<get_stripe_profile> {response:?}");
     // let bytes = response.bytes().await.ok()?;
     // crate::debug!("<get_stripe_profile> {:?}", unsafe { std::str::from_utf8_unchecked(&bytes[..]) });
-    // serde_json::from_slice::<StripeProfile>(&bytes).ok()
+    // sonic_rs::from_slice::<StripeProfile>(&bytes).ok()
     let response = request.send().await.ok()?;
     crate::debug!("<get_stripe_profile> {}", response.status());
     response.json().await.ok()
@@ -346,7 +390,7 @@ pub async fn get_user_profile(
     // crate::debug!("<get_user_profile> {response:?}");
     // let bytes = response.bytes().await.ok()?;
     // crate::debug!("<get_user_profile> {:?}", unsafe { std::str::from_utf8_unchecked(&bytes[..]) });
-    // serde_json::from_slice::<UserProfile>(&bytes).ok()
+    // sonic_rs::from_slice::<UserProfile>(&bytes).ok()
     let response = request.send().await.ok()?;
     crate::debug!("<get_user_profile> {}", response.status());
     response.json::<UserProfile>().await.ok()
@@ -369,6 +413,8 @@ pub async fn get_available_models(
             use_pri,
             cookie: None,
             exact_length: Some(data.len()),
+            platform: None,
+            arch: None,
         });
         client.body(data).send().await.ok()?.bytes().await.ok()?
     };
@@ -389,7 +435,7 @@ pub async fn get_token_usage(
     // crate::debug!("{}",time.timestamp_millis());
     // crate::debug!("{}",DateTime::now().timestamp_millis());
 
-    let body = bytes::Bytes::from(__unwrap!(serde_json::to_vec(&{
+    let body = bytes::Bytes::from(__unwrap!(sonic_rs::to_vec(&{
         let req: GetFilteredUsageEventsRequest = FilteredUsageArgs {
             start: Some(time),
             end: None,
@@ -726,7 +772,7 @@ async fn refresh_token(ext_token: &ExtToken, use_pri: bool) -> Option<Token> {
 
     let refresh_request = RefreshTokenRequest { refresh_token: ext_token.primary_token.as_str() };
 
-    let body = serde_json::to_vec(&refresh_request).ok()?;
+    let body = sonic_rs::to_vec(&refresh_request).ok()?;
 
     let response =
         super::client::build_token_refresh_request(&ext_token.get_client(), use_pri, body)
@@ -753,6 +799,8 @@ pub async fn get_server_config(ext_token: ExtToken, use_pri: bool) -> Option<uui
             use_pri,
             cookie: None,
             exact_length: Some(0),
+            platform: None,
+            arch: None,
         });
         client.send().await.ok()?.bytes().await.ok()?
     };
@@ -874,7 +922,7 @@ pub async fn get_sessions(
     crate::debug!("<get_sessions> {}", response.status());
     // let bytes = response.bytes().await.ok()?;
     // crate::debug!("<get_sessions> {}", unsafe{core::str::from_utf8_unchecked(&bytes[..])});
-    // serde_json::from_slice::<ListActiveSessionsResponse>(&bytes[..]).ok().map(|r| r.sessions)
+    // sonic_rs::from_slice::<ListActiveSessionsResponse>(&bytes[..]).ok().map(|r| r.sessions)
     response.json::<ListActiveSessionsResponse>().await.ok().map(|r| r.sessions)
 }
 
@@ -890,7 +938,7 @@ pub async fn get_sessions(
 //         auth_token,
 //         aggregated_usage_events_url,
 //         use_pri,
-//         bytes::Bytes::from(__unwrap!(serde_json::to_vec(&{
+//         bytes::Bytes::from(__unwrap!(sonic_rs::to_vec(&{
 //             const DELTA: chrono::TimeDelta = __unwrap!(chrono::TimeDelta::new(2629743, 765840000));
 //             let now = DateTime::utc_now();
 //             let start_date = now - DELTA;
@@ -907,7 +955,7 @@ pub async fn get_sessions(
 //     crate::debug!("<get_aggregated_usage_events> {}", response.status());
 //     let bytes = response.bytes().await.ok()?;
 //     // crate::debug!("<get_aggregated_usage_events> {}", unsafe{core::str::from_utf8_unchecked(&bytes[..])});
-//     serde_json::from_slice(&bytes[..]).ok()
+//     sonic_rs::from_slice(&bytes[..]).ok()
 // }
 
 pub struct FilteredUsageArgs {
@@ -969,7 +1017,7 @@ pub async fn get_filtered_usage_events(
     crate::debug!("<get_filtered_usage_events> {}", res.status());
     let res = res.bytes().await.ok()?;
     // crate::debug!("<get_filtered_usage_events> {}", unsafe {core::str::from_utf8_unchecked(&res[..])});
-    serde_json::from_slice(&res[..]).ok()
+    sonic_rs::from_slice(&res[..]).ok()
 }
 
 #[inline]

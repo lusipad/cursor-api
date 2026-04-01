@@ -1,32 +1,42 @@
 {
-    "name": "default",
-    "version": "0.0.0",
-    "description": "Default Route Registry",
-    "author": "wisdgod <nav@wisdgod.com>",
-    "license": "MIT OR Apache-2.0",
-    "routes": {
-        "/": {
-            "type": "empty",
-            "status": 307,
-            "headers": [["Location", "/health"]]
-        },
-        "/about": {
-            "type": "empty",
-            "status": 307,
-            "headers": [["Location", "/readme"]]
-        },
-        "/tokens": "tokens.min.html",
-        "/proxies": "proxies.min.html",
-        "/logs": "logs.min.html",
-        "/config": "config.min.html",
-        "/static/shared.js": "shared.min.js",
-        "/static/shared-styles.css": "shared-styles.min.css",
-        "/api": "api.min.html",
-        "/build-key": "build_key.min.html",
-        "/generate_204": {
-            "type": "empty",
-            "status": 204,
-            "headers": []
-        }
+  "name": "default",
+  "version": "0.0.0",
+  "description": "Default Route Registry",
+  "author": "wisdgod <nav@wisdgod.com>",
+  "license": "MIT OR Apache-2.0",
+  "routes": {
+    "/": {
+      "type": "empty",
+      "status": 307,
+      "headers": [
+        [
+          "Location",
+          "/health"
+        ]
+      ]
+    },
+    "/about": {
+      "type": "empty",
+      "status": 307,
+      "headers": [
+        [
+          "Location",
+          "/readme"
+        ]
+      ]
+    },
+    "/tokens": "tokens.min.html",
+    "/proxies": "proxies.min.html",
+    "/logs": "logs.min.html",
+    "/config": "config.min.html",
+    "/static/shared.js": "shared.min.js",
+    "/static/shared-styles.css": "shared-styles.min.css",
+    "/api": "api.min.html",
+    "/build-key": "build_key.min.html",
+    "/generate_204": {
+      "type": "empty",
+      "status": 204,
+      "headers": []
     }
+  }
 }

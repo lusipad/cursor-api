@@ -1,4 +1,4 @@
-use super::{IndexMap, Role};
+use super::{JsonObject, Role, object_via_serde_json};
 use crate::{
     app::constant::{ERROR, TYPE},
     common::utils::const_string::const_string,
@@ -86,7 +86,8 @@ pub enum ContentBlockParam {
     ToolUse {
         id: ByteStr,
         name: ByteStr,
-        input: IndexMap<String, serde_json::Value>,
+        #[cfg_attr(feature = "__perf", serde(with = "object_via_serde_json"))]
+        input: JsonObject,
     },
     ToolResult {
         tool_use_id: ByteStr,
@@ -98,28 +99,28 @@ pub enum ContentBlockParam {
     Taked,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum ToolResultContent {
     String(String),
     Array(Vec<ToolResultContentBlock>),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolResultContentBlock {
     Text { text: String },
     Image { source: ImageSource },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
     Base64(ImageSourceBase64),
     Url { url: String },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ImageSourceBase64 {
     pub data: String,
     pub media_type: MediaType,
@@ -323,7 +324,7 @@ impl<'de> Deserialize<'de> for TextBlockParam {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Tool {
-    pub input_schema: IndexMap<String, serde_json::Value>,
+    pub input_schema: JsonObject,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -419,7 +420,7 @@ pub enum ContentBlock {
     ToolUse {
         id: ByteStr,
         name: ByteStr,
-        input: IndexMap<String, serde_json::Value>,
+        input: JsonObject,
     },
 }
 

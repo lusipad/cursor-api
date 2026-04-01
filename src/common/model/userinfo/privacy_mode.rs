@@ -1,5 +1,3 @@
-use crate::common::model::is_default;
-
 #[derive(
     Debug,
     Default,
@@ -46,6 +44,6 @@ pub enum PrivacyMode {
 pub struct PrivacyModeInfo {
     #[serde(alias = "privacyMode", default)]
     pub privacy_mode: PrivacyMode,
-    #[serde(alias = "isEnforcedByTeam", default, skip_serializing_if = "is_default")]
+    #[serde(alias = "isEnforcedByTeam", default, skip_serializing_if = "::proto_value::is_default")]
     pub is_enforced_by_team: bool,
 }

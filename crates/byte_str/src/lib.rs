@@ -72,7 +72,7 @@ impl ByteStr {
     /// behavior to call this with `bytes` that is not valid UTF-8.
     pub unsafe fn from_utf8_unchecked(bytes: Bytes) -> ByteStr {
         if cfg!(debug_assertions) {
-            match utf8::validate_utf8(&bytes.as_ref()) {
+            match utf8::validate_utf8(bytes.as_ref()) {
                 Ok(_) => (),
                 Err(err) => panic!(
                     "ByteStr::from_utf8_unchecked() with invalid bytes; error = {err}, bytes = {bytes:?}",
@@ -93,6 +93,9 @@ impl ByteStr {
     #[inline]
     pub const fn len(&self) -> usize { self.bytes.len() }
 
+    #[inline]
+    pub const fn is_empty(&self) -> bool { self.len() == 0 }
+
     #[must_use]
     #[inline(always)]
     pub const fn as_bytes(&self) -> &Bytes { &self.bytes }
@@ -105,12 +108,10 @@ impl ByteStr {
     #[must_use]
     #[inline]
     pub unsafe fn slice_unchecked<I>(&self, index: I) -> Self
-    where
-        I: core::slice::SliceIndex<[u8], Output = [u8]>,
-    {
+    where I: core::slice::SliceIndex<[u8], Output = [u8]> {
         let slice = self.as_ref();
         let ptr = index.get_unchecked(slice);
-        
+
         let len = core::ptr::metadata(ptr);
 
         if len == 0 {

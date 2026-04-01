@@ -1,5 +1,8 @@
 use super::raw_json::{RawJson, to_raw_json};
 
+#[cfg(not(feature = "__perf"))]
+use serde_json as sonic_rs;
+
 pub struct Cached<T, U> {
     value: T,
     cache: U,
@@ -30,7 +33,7 @@ pub struct JsonCached<T: serde::Serialize> {
 
 impl<T: serde::Serialize> JsonCached<T> {
     #[inline]
-    pub fn new(value: T) -> serde_json::Result<Self> {
+    pub fn new(value: T) -> sonic_rs::Result<Self> {
         Ok(JsonCached { inner: Cached::new(value, to_raw_json)? })
     }
     #[inline]

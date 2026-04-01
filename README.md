@@ -1,5 +1,15 @@
 # cursor-api
 
+> ⚠️ **This branch is archived and will no longer be maintained.**
+
+This is the legacy codebase preserved for historical reference.
+
+## Why archived?
+
+- Accumulated technical debt from early learning phase
+- Frequent upstream API breaking changes led to fragile workarounds
+- Project structure no longer sustainable for further development
+
 ## 说明
 
 * 当前版本已稳定，若发现响应出现缺字漏字，与本程序无关。

@@ -2,15 +2,19 @@ use super::aiserver::v1::{
     ComposerExternalLink, ConversationMessage, ConversationMessageHeader, WebReference,
     image_proto::Dimension,
 };
-use crate::app::model::proxy_pool::get_fetch_image_client;
+use crate::{
+    app::model::proxy_pool::get_fetch_image_client,
+    core::aiserver::v1::conversation_message::MessageType,
+};
 
-pub mod anthropic;
-pub mod openai;
+pub mod chat_completions;
+pub mod messages;
 
 mod error;
 mod traits;
 mod utils;
 pub use error::Error as AdapterError;
+use traits::ToByteStr as _;
 pub use utils::ToolId;
 
 crate::define_typed_constants! {
@@ -138,7 +142,7 @@ fn extract_web_references_info(text: String) -> (String, Vec<WebReference>, bool
     }
 }
 
-struct BaseUuid {
+pub(super) struct BaseUuid {
     inner: u16,
     buffer: itoa::Buffer,
 }
@@ -252,25 +256,15 @@ async fn process_http_to_base64_image(
     ))
 }
 
-struct Messages {
+pub struct ConversationMessages {
     inner: Vec<ConversationMessage>,
-    headers: Vec<ConversationMessageHeader>,
 }
 
-impl Messages {
+impl ConversationMessages {
     #[inline]
-    fn with_capacity(capacity: usize) -> Self {
-        Self { inner: Vec::with_capacity(capacity), headers: Vec::with_capacity(capacity) }
-    }
+    fn with_capacity(capacity: usize) -> Self { Self { inner: Vec::with_capacity(capacity) } }
     #[inline]
-    fn push(&mut self, message: ConversationMessage) {
-        self.headers.push(ConversationMessageHeader {
-            bubble_id: message.bubble_id.clone(),
-            server_bubble_id: message.server_bubble_id.clone(),
-            r#type: message.r#type,
-        });
-        self.inner.push(message);
-    }
+    fn push(&mut self, message: ConversationMessage) { self.inner.push(message); }
     #[inline]
     fn from_single(message: ConversationMessage) -> Self {
         let mut v = Self::with_capacity(1);
@@ -279,4 +273,29 @@ impl Messages {
     }
     #[inline]
     fn last_mut(&mut self) -> Option<&mut ConversationMessage> { self.inner.last_mut() }
+    #[inline]
+    fn finalize(mut self) -> (Vec<ConversationMessage>, Vec<ConversationMessageHeader>) {
+        let headers = self
+            .inner
+            .iter_mut()
+            .map(|message| {
+                match message.r#type.try_get() {
+                    Ok(MessageType::Human) => {
+                        message.bubble_id = uuid::Uuid::new_v4().to_byte_str();
+                    }
+                    Ok(MessageType::Ai) => {
+                        message.bubble_id = uuid::Uuid::new_v4().to_byte_str();
+                        message.server_bubble_id = Some(uuid::Uuid::new_v4().to_byte_str());
+                    }
+                    _ => {}
+                }
+                ConversationMessageHeader {
+                    bubble_id: message.bubble_id.clone(),
+                    server_bubble_id: message.server_bubble_id.clone(),
+                    r#type: message.r#type,
+                }
+            })
+            .collect();
+        (self.inner, headers)
+    }
 }

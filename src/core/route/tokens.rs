@@ -62,7 +62,7 @@ pub async fn handle_set_tokens(
     for (alias, token_info) in tokens {
         let _ = token_manager.add(token_info, alias);
     }
-    let tokens_count = token_manager.tokens().len();
+    let tokens_count = token_manager.tokens_len();
 
     // 保存到文件
     token_manager.save().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -81,12 +81,8 @@ pub async fn handle_add_tokens(
     let mut token_manager = state.token_manager_write().await;
 
     // 创建现有token的集合
-    let existing_tokens: HashSet<_> = token_manager
-        .tokens()
-        .iter()
-        .flatten()
-        .map(|info| info.bundle.primary_token.raw())
-        .collect();
+    let existing_tokens: HashSet<_> =
+        token_manager.valid_tokens().map(|info| info.bundle.primary_token.raw()).collect();
 
     // 处理新的tokens
     let mut new_tokens = Vec::with_capacity(request.tokens.len());
@@ -142,7 +138,7 @@ pub async fn handle_add_tokens(
         for (token_info, alias) in new_tokens {
             let _ = token_manager.add(token_info, alias);
         }
-        let tokens_count = token_manager.tokens().len();
+        let tokens_count = token_manager.tokens_len();
 
         // 保存到文件
         token_manager.save().await.map_err(|_| {
@@ -163,7 +159,7 @@ pub async fn handle_add_tokens(
         }))
     } else {
         // 如果没有新tokens，返回当前状态
-        let tokens_count = token_manager.tokens().len();
+        let tokens_count = token_manager.tokens_len();
 
         Ok(InfallibleJson(TokensAddResponse { tokens_count, message: "No new tokens were added" }))
     }

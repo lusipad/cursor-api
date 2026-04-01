@@ -221,7 +221,6 @@ mod hashmap {
         assert_eq!(INST_CNT.load(Relaxed), 0);
     }
 
-    #[cfg_attr(miri, ignore)]
     #[test]
     fn capacity_sync() {
         static INST_CNT: AtomicUsize = AtomicUsize::new(0);
@@ -234,7 +233,7 @@ mod hashmap {
                 .is_none()
         );
 
-        let reserved_capacity = 1_048_576_usize;
+        let reserved_capacity = if cfg!(miri) { 4096 } else { 1_048_576_usize };
 
         let reserve = hashmap.reserve(reserved_capacity);
         assert!(reserve.is_some());
@@ -2539,7 +2538,7 @@ mod treeindex {
         static INST_CNT: AtomicUsize = AtomicUsize::new(0);
 
         let num_threads = 3;
-        let num_iter = if cfg!(miri) { 1 } else { 16 };
+        let num_iter = if cfg!(miri) { 1 } else { 64 };
         let workload_size = if cfg!(miri) { 32 } else { 1024 };
         let tree: Arc<TreeIndex<String, R>> = Arc::new(TreeIndex::default());
         let mut threads = Vec::with_capacity(num_threads);
@@ -2559,7 +2558,7 @@ mod treeindex {
                             }
                         }
                         1 => {
-                            for k in 0..workload_size / 8 {
+                            for k in 0..workload_size / 16 {
                                 tree.remove_sync(format!("{}", k * 4).as_str());
                             }
                         }
@@ -2595,7 +2594,7 @@ mod treeindex {
         static INST_CNT: AtomicUsize = AtomicUsize::new(0);
         let tree: TreeIndex<String, R> = TreeIndex::default();
 
-        let workload_size = 4096;
+        let workload_size = if cfg!(miri) { 512 } else { 4096 };
         for k in 0..workload_size {
             assert!(tree.insert_sync(format!("{k}"), R::new(&INST_CNT)).is_ok());
         }
@@ -2630,7 +2629,7 @@ mod treeindex {
             }
         }
 
-        let data_size = 4096;
+        let data_size = if cfg!(miri) { 512 } else { 4096 };
         let tree: TreeIndex<String, R> = TreeIndex::new();
         for k in 0..data_size {
             assert!(tree.insert_sync(format!("{k}"), R::new()).is_ok());

@@ -34,7 +34,7 @@ use crate::{
     },
 };
 pub use alias::Alias;
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, sync::Arc};
 pub use build_key::{
     BuildKeyRequest, BuildKeyResponse, GetConfigVersionRequest, GetConfigVersionResponse,
     UsageCheckModelType,
@@ -49,7 +49,7 @@ pub use fetch_model::FetchMode;
 pub use hash::Hash;
 pub use id_source::ModelIdSource;
 use interned::{ArcStr, Str};
-pub use log::{GetLogsParams, LogUpdate, manager as log_manager};
+pub use log::{LogPatch, LogQuery, manager as log_manager};
 pub use proxy::{
     ProxiesDeleteRequest, ProxiesDeleteResponse, ProxyAddRequest, ProxyInfoResponse,
     ProxyUpdateRequest, SetGeneralProxyRequest,
@@ -603,7 +603,7 @@ impl ExtTokenHelper {
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize)]
 struct TokenInfoHelper {
-    alias: String,
+    alias: Arc<str>,
     bundle: ExtTokenHelper,
     status: TokenStatus,
     usage: Option<UsageProfile>,
@@ -614,7 +614,7 @@ struct TokenInfoHelper {
 
 impl TokenInfoHelper {
     #[inline]
-    fn new(token_info: &TokenInfo, alias: String) -> Self {
+    fn new(token_info: &TokenInfo, alias: Arc<str>) -> Self {
         Self {
             alias,
             bundle: ExtTokenHelper::new(&token_info.bundle),
@@ -627,7 +627,7 @@ impl TokenInfoHelper {
     }
 
     #[inline]
-    fn extract(self) -> (TokenInfo, String) {
+    fn extract(self) -> (TokenInfo, Arc<str>) {
         (
             TokenInfo {
                 bundle: self.bundle.extract(),

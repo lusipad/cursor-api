@@ -1,11 +1,10 @@
-use ::core::{fmt, str::FromStr};
-use ::rand::{
+use core::{fmt, str::FromStr};
+use hex_simd::{AsciiCase, Out, decode, encode_as_str};
+use rand::{
     Rng as _,
     distr::{Distribution, StandardUniform},
 };
-use ::sha2::Digest as _;
-
-use crate::common::utils::hex::HEX_CHARS;
+use sha2::Digest as _;
 
 static mut SAFE_HASH: bool = false;
 
@@ -65,13 +64,7 @@ impl Hash {
     #[allow(clippy::wrong_self_convention)]
     #[inline]
     pub fn to_str<'buf>(&self, buf: &'buf mut [u8; 64]) -> &'buf mut str {
-        for (i, &byte) in self.0.iter().enumerate() {
-            buf[i * 2] = HEX_CHARS[(byte >> 4) as usize];
-            buf[i * 2 + 1] = HEX_CHARS[(byte & 0x0f) as usize];
-        }
-
-        // SAFETY: 输出都是有效的 ASCII 字符
-        unsafe { ::core::str::from_utf8_unchecked_mut(buf) }
+        encode_as_str(&self.0, Out::from_slice(buf), AsciiCase::Lower)
     }
 }
 
@@ -93,17 +86,10 @@ impl FromStr for Hash {
 
     #[inline]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let hex_array: &[u8; 64] = s
-            .as_bytes()
-            .try_into()
-            .map_err(|_| HashError::InvalidLength)?;
-
-        let hex_pairs = unsafe { hex_array.as_chunks_unchecked::<2>() };
+        let hex_array: &[u8; 64] = s.as_bytes().try_into().map_err(|_| HashError::InvalidLength)?;
         let mut result = [0u8; 32];
 
-        for (dst, &[hi, lo]) in result.iter_mut().zip(hex_pairs) {
-            *dst = crate::common::utils::hex::hex_to_byte(hi, lo).ok_or(HashError::InvalidHex)?;
-        }
+        decode(hex_array, Out::from_slice(&mut result)).map_err(|_| HashError::InvalidHex)?;
 
         Ok(Self(result))
     }
@@ -112,9 +98,7 @@ impl FromStr for Hash {
 impl ::serde::Serialize for Hash {
     #[inline]
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: ::serde::Serializer,
-    {
+    where S: ::serde::Serializer {
         serializer.serialize_str(self.to_str(&mut [0u8; 64]))
     }
 }
@@ -122,9 +106,7 @@ impl ::serde::Serialize for Hash {
 impl<'de> ::serde::Deserialize<'de> for Hash {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: ::serde::Deserializer<'de>,
-    {
+    where D: ::serde::Deserializer<'de> {
         let s = <&str as ::serde::Deserialize>::deserialize(deserializer)?;
         Self::from_str(s).map_err(::serde::de::Error::custom)
     }

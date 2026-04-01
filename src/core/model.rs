@@ -2,13 +2,100 @@ pub mod anthropic;
 pub mod openai;
 mod resolver;
 
-// use crate::app::constant::TOOLU01_PREFIX;
+/// Deserializes `sonic_rs::Object` through `serde_json::Map` as an intermediate
+/// representation, then structurally converts to sonic-rs's native types.
+///
+/// # Why this exists
+///
+/// sonic-rs's optimized types (`Value`, `Object`, etc.) use a private
+/// serialization protocol: their `Deserialize` implementations invoke
+/// `deserializer.deserialize_newtype_struct(TOKEN, visitor)` with a magic token
+/// (`"$sonic_rs::private::Value"`), and their `Visitor` only handles
+/// `visit_bytes`, expecting raw in-memory bytes. This protocol only works when
+/// the `Deserializer` is sonic-rs's own.
+///
+/// When these types appear inside serde's internally-tagged enums
+/// (`#[serde(tag = "...")]`), serde first buffers the entire object into
+/// `serde::__private::de::Content` — a format-neutral intermediate
+/// representation designed primarily around serde_json's data model. When
+/// `ContentDeserializer` later re-drives deserialization, it does not recognize
+/// the magic token and falls through to unimplemented visitor methods, causing
+/// deserialization to fail.
+///
+/// By deserializing into `serde_json` types first (which use standard serde
+/// protocols compatible with any `Deserializer`, including `ContentDeserializer`)
+/// and then performing a direct structural conversion, we sidestep the
+/// incompatibility entirely.
+///
+/// # Upstream references
+///
+/// - <https://github.com/cloudwego/sonic-rs/issues/114>
+/// - <https://github.com/serde-rs/serde/pull/2912>
+#[cfg(feature = "__perf")]
+mod object_via_serde_json {
+    use serde::{Deserialize, Deserializer};
+    use sonic_rs::{Array, Object, Value};
+
+    type JsonMap = serde_json::Map<String, serde_json::Value>;
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Object, D::Error> {
+        JsonMap::deserialize(deserializer).map(convert_object)
+    }
+
+    fn convert_value(v: serde_json::Value) -> Value {
+        match v {
+            serde_json::Value::Null => Value::new_null(),
+            serde_json::Value::Bool(b) => Value::new_bool(b),
+            serde_json::Value::Number(n) => convert_number(n),
+            serde_json::Value::String(s) => Value::copy_str(&s),
+            serde_json::Value::Array(a) => convert_array(a).into_value(),
+            serde_json::Value::Object(m) => convert_object(m).into_value(),
+        }
+    }
+
+    fn convert_number(n: serde_json::Number) -> Value {
+        if let Some(i) = n.as_i64() {
+            Value::new_i64(i)
+        } else if let Some(u) = n.as_u64() {
+            Value::new_u64(u)
+        } else {
+            // `serde_json::Number` guarantees finite values; safe to unwrap.
+            Value::new_f64(n.as_f64().unwrap()).unwrap()
+        }
+    }
+
+    fn convert_array(vec: Vec<serde_json::Value>) -> Array {
+        let mut array = Array::with_capacity(vec.len());
+        for v in vec {
+            array.push(convert_value(v));
+        }
+        array
+    }
+
+    fn convert_object(map: JsonMap) -> Object {
+        let mut obj = Object::with_capacity(map.len());
+        for (k, v) in map {
+            obj.insert(&k, convert_value(v));
+        }
+        obj
+    }
+}
+
 use super::constant::Models;
 use crate::{app::route::InfallibleSerialize, common::model::raw_json::RawJson};
 pub(crate) use resolver::{ExtModel, init_resolver};
 use serde::{Serialize, ser::SerializeStruct as _};
 
-pub(super) type IndexMap<K, V> = indexmap::IndexMap<K, V, ahash::RandomState>;
+#[cfg(feature = "__perf")]
+pub(super) type JsonObject = sonic_rs::Object;
+#[cfg(not(feature = "__perf"))]
+pub(super) type JsonObject = indexmap::IndexMap<String, serde_json::Value, ahash::RandomState>;
+
+pub(super) struct ChatCompletions;
+pub(super) struct Messages;
+// pub(super) struct Responses;
 
 #[derive(
     ::serde::Serialize,

@@ -6,10 +6,10 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize};
 
 use saa::Lock;
-use sdd::{AtomicShared, Epoch, Shared, Tag};
+use sdd::{AtomicRaw, Epoch, Owned, RawPtr};
 
 use crate::data_block::DataBlock;
-use crate::utils::AsyncGuard;
+use crate::utils::{AsyncGuard, deref_unchecked, fake_ref, get_owned, likely};
 use crate::{Equivalent, Guard};
 
 /// [`Bucket`] is a lock-protected fixed-size entry array.
@@ -94,7 +94,7 @@ struct Metadata<K, V, const LEN: usize> {
     /// removed if `TYPE = INDEX`.
     partial_hash_array: UnsafeCell<[u8; LEN]>,
     /// Linked list of entries.
-    link: AtomicShared<LinkedBucket<K, V>>,
+    link: AtomicRaw<LinkedBucket<K, V>>,
 }
 
 /// The size of the linked data block.
@@ -124,7 +124,7 @@ impl<K, V, L: LruList, const TYPE: char> Bucket<K, V, L, TYPE> {
                 occupied_bitmap: AtomicU32::default(),
                 removed_bitmap: AtomicU32::default(),
                 partial_hash_array: UnsafeCell::new(Default::default()),
-                link: AtomicShared::default(),
+                link: AtomicRaw::null(),
             },
             lru_list: L::default(),
         }
@@ -198,7 +198,7 @@ impl<K, V, L: LruList, const TYPE: char> Bucket<K, V, L, TYPE> {
                 .occupied_bitmap
                 .store(occupied_bitmap, Relaxed);
             let removed = link.data_block.read(entry_ptr.pos as usize);
-            if occupied_bitmap == 0 && TYPE != INDEX {
+            if occupied_bitmap == 0 && (TYPE != INDEX || !needs_drop::<(K, V)>()) {
                 entry_ptr.unlink(&self.metadata.link);
             }
             removed
@@ -318,17 +318,13 @@ impl<K, V, L: LruList, const TYPE: char> Bucket<K, V, L, TYPE> {
 
         // Allocate additional overflow buckets.
         for _ in 0..(required - capacity).div_ceil(LINKED_BUCKET_LEN) {
-            let new_link = LinkedBucket::new(None);
+            let new_link = LinkedBucket::new();
             let new_link_ptr = new_link.as_ptr();
             if let Some(link) = link_ref(link_ptr) {
                 new_link.prev_link.store(link_ptr.cast_mut(), Relaxed);
-                link.metadata
-                    .link
-                    .swap((Some(new_link), Tag::None), Release);
+                link.metadata.link.store(new_link.into_raw(), Release);
             } else {
-                self.metadata
-                    .link
-                    .swap((Some(new_link), Tag::None), Release);
+                self.metadata.link.store(new_link.into_raw(), Release);
             }
             link_ptr = new_link_ptr;
         }
@@ -380,11 +376,15 @@ impl<K, V, L: LruList, const TYPE: char> Bucket<K, V, L, TYPE> {
     /// The [`Bucket`] and the [`DataBlock`] should never be used afterward.
     pub(super) fn drop_entries(&self, data_block: NonNull<DataBlock<K, V, BUCKET_LEN>>) {
         if !self.metadata.link.is_null(Relaxed) {
-            let mut next = self.metadata.link.swap((None, Tag::None), Acquire);
-            while let Some(current) = next.0 {
-                next = current.metadata.link.swap((None, Tag::None), Acquire);
-                let dropped = unsafe { current.drop_in_place() };
-                debug_assert!(dropped);
+            let mut link_ptr = self.metadata.link.load(Acquire, fake_ref(self));
+            while let Some(current) = deref_unchecked(link_ptr) {
+                let next_link_ptr = current.metadata.link.load(Acquire, fake_ref(self));
+                if let Some(link) = get_owned(link_ptr) {
+                    unsafe {
+                        link.drop_in_place();
+                    }
+                }
+                link_ptr = next_link_ptr;
             }
         }
         if needs_drop::<(K, V)>() {
@@ -422,14 +422,16 @@ impl<K, V, L: LruList, const TYPE: char> Bucket<K, V, L, TYPE> {
         }
 
         // Insert a new `LinkedBucket` at the linked list head.
-        let head = self.metadata.link.get_shared(Relaxed, fake_ref(self));
-        let link = LinkedBucket::new(head);
+        let link = LinkedBucket::new();
+        let head_ptr = self.metadata.link.load(Relaxed, fake_ref(self));
+        link.metadata.link.store(head_ptr, Relaxed);
         self.insert_entry(&link.metadata, &link.data_block, 0, partial_hash, 1, entry);
-        if let Some(head) = link_ref(link.metadata.load_link()) {
+        if let Some(head) = deref_unchecked(head_ptr) {
             head.prev_link.store(link.as_ptr().cast_mut(), Relaxed);
         }
-        let link_ptr = link.as_ptr();
-        self.metadata.link.swap((Some(link), Tag::None), Release);
+        link_ptr = link.as_ptr();
+        self.metadata.link.store(link.into_raw(), Release);
+
         EntryPtr { link_ptr, pos: 0 }
     }
 
@@ -473,11 +475,15 @@ impl<K, V, L: LruList, const TYPE: char> Bucket<K, V, L, TYPE> {
                     {
                         debug_assert!(link.metadata.link.is_null(Relaxed));
                         let unlinked = if let Some(prev) = link_ref(prev_link_ptr) {
-                            prev.metadata.link.swap((None, Tag::None), Acquire).0
+                            let unlinked = prev.metadata.link.load(Acquire, fake_ref(self));
+                            prev.metadata.link.store(RawPtr::null(), Release);
+                            unlinked
                         } else {
-                            self.metadata.link.swap((None, Tag::None), Acquire).0
+                            let unlinked = self.metadata.link.load(Acquire, fake_ref(self));
+                            self.metadata.link.store(RawPtr::null(), Release);
+                            unlinked
                         };
-                        debug_assert!(unlinked.is_some_and(Shared::release));
+                        drop(get_owned(unlinked));
                     } else {
                         next_link_ptr = link_ptr;
                     }
@@ -733,15 +739,16 @@ impl<K, V, L: LruList, const TYPE: char> Writer<K, V, L, TYPE> {
             // In case `TYPE == INDEX`, `(K, V)` that need `drop` should be dropped in
             // `drop_entries` to make sure that they are dropped before the container is dropped;
             // they should never be passed to the garbage collector.
-            let mut link = self.metadata.link.swap((None, Tag::None), Acquire).0;
-            while let Some(current) = link {
-                link = current.metadata.link.swap((None, Tag::None), Acquire).0;
-                let released = if TYPE == INDEX {
-                    current.release()
-                } else {
-                    unsafe { current.drop_in_place() }
-                };
-                debug_assert!(released);
+            let mut link_ptr = self.metadata.link.load(Acquire, fake_ref(&self));
+            self.metadata.link.store(RawPtr::null(), Release);
+            while let Some(link) = deref_unchecked(link_ptr) {
+                let next_link_ptr = link.metadata.link.load(Acquire, fake_ref(&self));
+                if let Some(link) = get_owned(link_ptr) {
+                    if TYPE != INDEX {
+                        unsafe { link.drop_in_place() }
+                    }
+                }
+                link_ptr = next_link_ptr;
             }
         }
 
@@ -939,33 +946,34 @@ impl<K, V, const TYPE: char> EntryPtr<K, V, TYPE> {
     /// Unlinks the [`LinkedBucket`] currently pointed to by this [`EntryPtr`] from the linked list.
     ///
     /// The associated [`Bucket`] must be locked.
-    fn unlink(&mut self, link_head: &AtomicShared<LinkedBucket<K, V>>) {
-        debug_assert_ne!(TYPE, INDEX);
-
+    fn unlink(&mut self, link_head: &AtomicRaw<LinkedBucket<K, V>>) {
         let prev_link_ptr =
-            link_ref(self.link_ptr).map_or(ptr::null_mut(), |link| link.prev_link.load(Relaxed));
-        let next = link_ref(self.link_ptr)
-            .and_then(|link| link.metadata.link.swap((None, Tag::None), Relaxed).0);
-        if let Some(next) = next.as_ref() {
+            link_ref(self.link_ptr).map_or(ptr::null_mut(), |link| link.prev_link.load(Acquire));
+        let next_link = link_ref(self.link_ptr)
+            .and_then(|link| get_owned(link.metadata.link.load(Acquire, fake_ref(self))));
+        let next_link_ptr = if let Some(next) = next_link {
             // Move the pointer to the next `Link`.
             next.prev_link.store(prev_link_ptr, Relaxed);
             self.link_ptr = next.as_ptr();
             self.pos = INVALID;
+            next.into_raw()
         } else {
             // Move the pointer to the previous `Link`.
             self.link_ptr = prev_link_ptr;
             self.pos = INVALID - 1;
-        }
+            RawPtr::null()
+        };
 
         let unlinked = if let Some(prev) = link_ref(prev_link_ptr) {
-            prev.metadata.link.swap((next, Tag::None), Acquire).0
+            let unlinked = prev.metadata.link.load(Acquire, fake_ref(self));
+            prev.metadata.link.store(next_link_ptr, Release);
+            unlinked
         } else {
-            link_head.swap((next, Tag::None), Acquire).0
+            let unlinked = link_head.load(Acquire, fake_ref(self));
+            link_head.store(next_link_ptr, Release);
+            unlinked
         };
-        if let Some(link) = unlinked {
-            let dropped = unsafe { link.drop_in_place() };
-            debug_assert!(dropped);
-        }
+        drop(get_owned(unlinked));
     }
 
     /// Moves this [`EntryPtr`] to the next occupied entry in the [`Bucket`].
@@ -974,7 +982,11 @@ impl<K, V, const TYPE: char> EntryPtr<K, V, TYPE> {
     #[inline]
     fn next_entry<L: LruList, const LEN: usize>(&mut self, metadata: &Metadata<K, V, LEN>) -> bool {
         // Search for the next occupied entry.
-        let current_pos = if self.pos == INVALID { 0 } else { self.pos + 1 };
+        let current_pos = if likely(self.pos != INVALID) {
+            self.pos + 1
+        } else {
+            0
+        };
 
         if (current_pos as usize) < LEN {
             let bitmap = metadata.bitmap::<TYPE>() & (!((1_u32 << current_pos) - 1));
@@ -1183,7 +1195,12 @@ impl<K, V, const LEN: usize> Metadata<K, V, LEN> {
     /// Loads the linked bucket pointer.
     #[inline]
     fn load_link(&self) -> *const LinkedBucket<K, V> {
-        unsafe { self.link.load(Acquire, fake_ref(&self)).as_ptr_unchecked() }
+        unsafe {
+            self.link
+                .load(Acquire, fake_ref(&self))
+                .into_ptr()
+                .as_ptr_unchecked()
+        }
     }
 }
 
@@ -1193,23 +1210,17 @@ unsafe impl<K: Send + Sync, V: Send + Sync, const LEN: usize> Sync for Metadata<
 impl<K, V> LinkedBucket<K, V> {
     /// Creates an empty [`LinkedBucket`].
     #[inline]
-    fn new(next: Option<Shared<LinkedBucket<K, V>>>) -> Shared<Self> {
+    fn new() -> Owned<Self> {
         unsafe {
-            Shared::new_with_unchecked(|| {
-                let mut bucket = Self {
-                    metadata: Metadata {
-                        occupied_bitmap: AtomicU32::default(),
-                        removed_bitmap: AtomicU32::default(),
-                        partial_hash_array: UnsafeCell::new(Default::default()),
-                        link: AtomicShared::default(),
-                    },
-                    prev_link: AtomicPtr::default(),
-                    data_block: DataBlock::new(),
-                };
-                if let Some(next) = next {
-                    bucket.metadata.link = AtomicShared::from(next);
-                }
-                bucket
+            Owned::new_with_unchecked(|| Self {
+                metadata: Metadata {
+                    occupied_bitmap: AtomicU32::default(),
+                    removed_bitmap: AtomicU32::default(),
+                    partial_hash_array: UnsafeCell::new(Default::default()),
+                    link: AtomicRaw::default(),
+                },
+                prev_link: AtomicPtr::default(),
+                data_block: DataBlock::new(),
             })
         }
     }
@@ -1272,23 +1283,16 @@ const fn link_ref<'l, K, V>(ptr: *const LinkedBucket<K, V>) -> Option<&'l Linked
     unsafe { ptr.as_ref() }
 }
 
-/// Returns a fake reference for passing a reference to `U` when it is ensured that the returned
-/// reference is never used.
-#[inline]
-const fn fake_ref<'l, T, U>(v: &T) -> &'l U {
-    unsafe { &*ptr::from_ref(v).cast::<U>() }
-}
-
 #[cfg(not(feature = "loom"))]
 #[cfg(test)]
 mod test {
     use super::*;
 
+    use std::sync::Arc;
     use std::sync::atomic::AtomicPtr;
     use std::sync::atomic::Ordering::Relaxed;
 
     use proptest::prelude::*;
-    use sdd::Shared;
     use tokio::sync::Barrier;
 
     #[cfg(not(miri))]
@@ -1442,9 +1446,9 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn bucket_lock_sync() {
         let num_tasks = BUCKET_LEN + 2;
-        let barrier = Shared::new(Barrier::new(num_tasks));
-        let data_block: Shared<DataBlock<usize, usize, BUCKET_LEN>> = Shared::new(DataBlock::new());
-        let mut bucket: Shared<Bucket<usize, usize, (), MAP>> = Shared::new(Bucket::new());
+        let barrier = Arc::new(Barrier::new(num_tasks));
+        let data_block: Arc<DataBlock<usize, usize, BUCKET_LEN>> = Arc::new(DataBlock::new());
+        let bucket: Arc<Bucket<usize, usize, (), MAP>> = Arc::new(Bucket::new());
         let mut data: [u64; 128] = [0; 128];
         let mut task_handles = Vec::with_capacity(num_tasks);
         for task_id in 0..num_tasks {
@@ -1465,8 +1469,9 @@ mod test {
                         };
                     }
                     assert_eq!(sum % 256, 0);
-                    let data_block_ptr =
-                        unsafe { NonNull::new_unchecked(data_block_clone.as_ptr().cast_mut()) };
+                    let data_block_ptr = unsafe {
+                        NonNull::new_unchecked(Arc::as_ptr(&data_block_clone).cast_mut())
+                    };
                     if i == 0 {
                         assert!(
                             writer
@@ -1501,7 +1506,7 @@ mod test {
         assert_eq!(sum % 256, 0);
         assert_eq!(bucket.len(), num_tasks);
 
-        let data_block_ptr = unsafe { NonNull::new_unchecked(data_block.as_ptr().cast_mut()) };
+        let data_block_ptr = unsafe { NonNull::new_unchecked(Arc::as_ptr(&data_block).cast_mut()) };
         for task_id in 0..num_tasks {
             assert_eq!(
                 bucket.search_entry(
@@ -1524,7 +1529,7 @@ mod test {
         let writer = Writer::lock_sync(&bucket).unwrap();
         while entry_ptr.find_next(&writer) {
             writer.remove(
-                unsafe { NonNull::new_unchecked(data_block.as_ptr().cast_mut()) },
+                unsafe { NonNull::new_unchecked(Arc::as_ptr(&data_block).cast_mut()) },
                 &mut entry_ptr,
             );
         }
@@ -1532,6 +1537,6 @@ mod test {
         writer.kill();
 
         assert_eq!(bucket.len(), 0);
-        assert!(Writer::lock_sync(unsafe { bucket.get_mut().unwrap() }).is_none());
+        assert!(bucket.rw_lock.is_poisoned(Acquire));
     }
 }

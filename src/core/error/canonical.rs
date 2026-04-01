@@ -115,7 +115,7 @@ impl CanonicalError {
     #[inline]
     pub fn into_openai(self) -> openai::OpenAiErrorInner {
         let message = if let Some(details) = self.details {
-            Cow::Owned(__unwrap!(serde_json::to_string(&details)))
+            Cow::Owned(__unwrap!(sonic_rs::to_string(&details)))
         } else {
             Cow::Borrowed(UNKNOWN)
         };
@@ -137,7 +137,7 @@ impl CanonicalError {
                 details: CustomErrorDetails,
             }
 
-            Cow::Owned(__unwrap!(serde_json::to_string(&Message { code, details })))
+            Cow::Owned(__unwrap!(sonic_rs::to_string(&Message { code, details })))
         } else {
             code
         };

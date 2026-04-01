@@ -52,18 +52,14 @@ impl const Default for VisionAbility {
 impl Serialize for VisionAbility {
     #[inline]
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    where S: Serializer {
         serializer.serialize_str(self.as_str())
     }
 }
 
 impl<'de> Deserialize<'de> for VisionAbility {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         let s = String::deserialize(deserializer)?;
         Ok(Self::from_string(s))
     }

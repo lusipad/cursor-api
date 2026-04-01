@@ -19,6 +19,9 @@ use header::{JsonContentTypeError, json_content_type};
 use http::{StatusCode, header::CONTENT_TYPE};
 use serde::{Serialize, de::DeserializeOwned};
 
+#[cfg(not(feature = "__perf"))]
+use serde_json as sonic_rs;
+
 /// # Safety
 ///
 /// Implementors must guarantee that `serde::Serialize` for `T`
@@ -49,7 +52,7 @@ impl<T: InfallibleSerialize> IntoResponse for InfallibleJson<T> {
         }
 
         // SAFETY: T: InfallibleSerialize guarantees serialization cannot fail
-        let buf = unsafe { serde_json::to_vec(&self.0).unwrap_unchecked() };
+        let buf = unsafe { sonic_rs::to_vec(&self.0).unwrap_unchecked() };
         make_response(buf)
     }
 }
@@ -105,7 +108,7 @@ impl_json_from_request!(AnthropicJson, into_anthropic_tuple, AnthropicError);
 
 // Mark error types as infallible for serialization.
 // SAFETY: GenericError, OpenAiError, AnthropicError only contain
-// strings, numbers, options thereof — serde_json serialization cannot fail.
+// strings, numbers, options thereof — sonic_rs serialization cannot fail.
 unsafe impl InfallibleSerialize for GenericError {}
 unsafe impl InfallibleSerialize for OpenAiError {}
 unsafe impl InfallibleSerialize for AnthropicError {}

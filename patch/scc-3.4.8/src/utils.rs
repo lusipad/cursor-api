@@ -1,5 +1,5 @@
 use std::cell::UnsafeCell;
-use std::mem::ManuallyDrop;
+use std::hint::unreachable_unchecked;
 use std::pin::{Pin, pin};
 use std::ptr;
 use std::sync::atomic::Ordering;
@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering::Acquire;
 
 use saa::lock::Mode;
 use saa::{Lock, Pager};
-use sdd::{AtomicShared, Ptr, Shared};
+use sdd::{AtomicRaw, Owned, RawPtr};
 
 use crate::Guard;
 
@@ -42,8 +42,8 @@ pub(crate) trait LockPager {
 
 /// Dereferences a pointer without checking the tag bits.
 #[inline]
-pub(crate) const fn deref_unchecked<T>(ptr: Ptr<'_, T>) -> Option<&'_ T> {
-    unsafe { ptr.as_ref_unchecked() }
+pub(crate) const fn deref_unchecked<T>(ptr: RawPtr<'_, T>) -> Option<&'_ T> {
+    unsafe { ptr.into_ptr().as_ref_unchecked() }
 }
 
 /// Unwraps an optional value without checking the state.
@@ -54,16 +54,42 @@ pub(crate) const fn unwrap_unchecked<T>(v: Option<T>) -> T {
 
 /// Takes the current snapshot of the value.
 #[inline]
-pub(crate) const fn take_snapshot<T>(v: &T) -> ManuallyDrop<T> {
-    ManuallyDrop::new(unsafe { ptr::from_ref(v).read() })
+pub(crate) const fn take_snapshot<T>(v: &T) -> T {
+    unsafe { ptr::from_ref(v).read() }
 }
 
-/// Drops the supplied [`Shared`] in-place.
+/// Gets an [`Owned`] from an [`RawPtr`].
 #[inline]
-pub(crate) fn drop_in_place<T>(v: Shared<T>) {
-    unsafe {
-        let _: bool = v.drop_in_place();
+pub(crate) fn get_owned<T>(a: RawPtr<'_, T>) -> Option<Owned<T>> {
+    unsafe { Owned::from_raw(a) }
+}
+
+/// Returns a fake reference for passing a reference to `U` when it is ensured that the returned
+/// reference is never used.
+#[inline]
+pub(crate) const fn fake_ref<'l, T, U>(v: &T) -> &'l U {
+    unsafe { &*ptr::from_ref(v).cast::<U>() }
+}
+
+/// Hint indicating that the condition is likely to be true.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub const fn likely(cond: bool) -> bool {
+    if cond {
+        true
+    } else {
+        #[cold]
+        #[inline]
+        const fn cold_path() {}
+        cold_path();
+        false
     }
+}
+
+/// Marker indicating that execution of any code following it is undefined behavior.
+#[inline]
+pub(crate) const fn undefined() -> ! {
+    unsafe { unreachable_unchecked() }
 }
 
 impl AsyncGuard {
@@ -92,20 +118,15 @@ impl AsyncGuard {
         }
     }
 
-    /// Loads the content of the [`AtomicShared`] without exposing the [`Guard`] or checking tag
-    /// bits.
+    /// Loads the value of the [`AtomicRaw`] without exposing the [`Guard`] or checking tag bits.
     #[inline]
-    pub(crate) fn load_unchecked<T>(
-        &self,
-        atomic_ptr: &AtomicShared<T>,
-        mo: Ordering,
-    ) -> Option<&T> {
-        unsafe { atomic_ptr.load(mo, self.guard()).as_ref_unchecked() }
+    pub(crate) fn load_unchecked<T>(&self, atomic_ptr: &AtomicRaw<T>, mo: Ordering) -> Option<&T> {
+        deref_unchecked(atomic_ptr.load(mo, self.guard()))
     }
 
     /// Checks if the reference is valid.
     #[inline]
-    pub(crate) fn check_ref<T>(&self, atomic_ptr: &AtomicShared<T>, r: &T, mo: Ordering) -> bool {
+    pub(crate) fn check_ref<T>(&self, atomic_ptr: &AtomicRaw<T>, r: &T, mo: Ordering) -> bool {
         self.load_unchecked(atomic_ptr, mo)
             .is_some_and(|s| ptr::eq(s, r))
     }

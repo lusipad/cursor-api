@@ -1,6 +1,6 @@
 [package]
 name = "proto-value"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 authors.workspace = true
 description.workspace = true
@@ -21,9 +21,9 @@ itoa = { version = "1.0.17", optional = true }
 serde_core = { version = "1.0", default-features = false, optional = true }
 
 [features]
-default = ["bytes", "byte_str"]
+default = ["alloc", "bytes", "byte_str"]
 alloc = []
-serde = ["dep:serde_core", "dep:base64-simd", "dep:itoa"]
+serde = ["alloc", "dep:serde_core", "dep:base64-simd", "dep:itoa"]
 std = ["alloc"]
 indexmap = ["dep:indexmap"]
 bytes = ["dep:bytes"]

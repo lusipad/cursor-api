@@ -5,33 +5,35 @@ use super::{
             CurrentFileInfo, CursorPosition, CursorRange, EnvironmentInfo, ImageProto, McpResult,
             ModelDetails, StreamUnifiedChatRequest, StreamUnifiedChatRequestWithTools,
             client_side_tool_v2_result, image_proto, mcp_params, stream_unified_chat_request,
-            stream_unified_chat_request_with_tools,
         },
-        model::{ExtModel, IndexMap},
+        model::{ExtModel, JsonObject},
     },
-    AGENT_MODE_NAME, ASK_MODE_NAME, AdapterError, BaseUuid, Messages, WEB_SEARCH_MODE,
+    AGENT_MODE_NAME, ASK_MODE_NAME, AdapterError, BaseUuid, ConversationMessages, WEB_SEARCH_MODE,
     is_animated_gif, process_http_image,
-    utils::{ToolId, ToolResultBuilder},
+    utils::{ToolContentBuilder, ToolId, ToolResult},
 };
-use crate::app::model::{AppConfig, VisionAbility, create_explicit_context};
+use crate::{
+    app::model::{AppConfig, VisionAbility, create_explicit_context},
+    common::utils::proto_encode::encode_messages_framed,
+};
 use byte_str::ByteStr;
 use url::Url;
 
-pub(super) trait ToolParam: Sized + 'static {
-    fn extract(self) -> (String, Option<String>, IndexMap<String, serde_json::Value>);
+pub(in crate::core) trait ToolParam: Sized + 'static {
+    fn extract(self) -> (String, Option<String>, JsonObject);
 }
 
-pub(super) trait ToolResult: Sized + 'static {
+pub(in crate::core) trait ToolContent: Sized + 'static {
     fn size_hint(&self) -> Option<usize>;
     fn is_error(&self) -> bool;
-    async fn add_to(self, builder: &mut ToolResultBuilder) -> Result<(), AdapterError>;
+    async fn add_to(self, builder: &mut ToolContentBuilder) -> Result<(), AdapterError>;
     async fn result(self) -> Result<ByteStr, AdapterError> {
         let mut builder = {
             let is_error = self.is_error();
             if let Some(capacity) = self.size_hint() {
-                ToolResultBuilder::with_capacity(capacity, is_error)
+                ToolContentBuilder::with_capacity(capacity, is_error)
             } else {
-                ToolResultBuilder::new(is_error)
+                ToolContentBuilder::new(is_error)
             }
         };
         self.add_to(&mut builder).await?;
@@ -39,23 +41,23 @@ pub(super) trait ToolResult: Sized + 'static {
     }
 }
 
-pub(super) trait ImageParams: Sized + 'static {
+pub(in crate::core) trait ImageParams: Sized + 'static {
     type Base64ImageParams: ?Sized;
     fn extract(&self) -> Result<&Self::Base64ImageParams, &str>;
 }
 
-pub(super) trait Adapter: Sized + 'static {
+pub(in crate::core) trait Adapter: Sized + 'static {
     type ImageParams: ImageParams;
     type MessageParams: Sized + 'static;
     type ToolParam: ToolParam;
-    type ToolResult: ToolResult;
+    type ToolContent: ToolContent;
     async fn process_message_params(
         params: Self::MessageParams,
         supported_tools: Vec<proto_value::Enum<ClientSideToolV2>>,
         now: chrono::DateTime<chrono_tz::Tz>,
         image_support: bool,
         is_agentic: bool,
-    ) -> Result<(String, Messages, Vec<ComposerExternalLink>), AdapterError>;
+    ) -> Result<(String, ConversationMessages, Vec<ComposerExternalLink>), AdapterError>;
     fn _process_base64_image(
         params: &<Self::ImageParams as ImageParams>::Base64ImageParams,
     ) -> Result<(Vec<u8>, image::ImageFormat), AdapterError>;
@@ -135,117 +137,112 @@ pub(super) trait Adapter: Sized + 'static {
 
         let long_context = AppConfig::is_long_context_enabled();
 
-        let message = StreamUnifiedChatRequestWithTools {
-            request: Some(
-                stream_unified_chat_request_with_tools::Request::StreamUnifiedChatRequest(
-                    Box::new(StreamUnifiedChatRequest {
-                        conversation: messages.inner,
-                        full_conversation_headers_only: messages.headers,
-                        // allow_long_file_scan: Some(false),
-                        explicit_context,
-                        // can_handle_filenames_after_language_ids: Some(false),
-                        model_details: Some(ModelDetails {
-                            model_name: Some(model.id()),
-                            azure_state: Some(AzureState::default()),
-                            enable_slow_pool: enable_slow_pool.to_opt(),
-                            max_mode: Some(model.max),
-                        }),
-                        use_web: if model.web {
-                            Some(ByteStr::from_static(WEB_SEARCH_MODE))
-                        } else {
-                            None
-                        },
-                        external_links,
-                        should_cache: Some(true),
-                        current_file: Some(CurrentFileInfo {
-                            contents_start_at_line: 1,
-                            cursor_position: Some(CursorPosition::default()),
-                            total_number_of_lines: 1,
-                            selection: Some(CursorRange {
-                                start_position: Some(CursorPosition::default()),
-                                end_position: Some(CursorPosition::default()),
-                            }),
-                            ..Default::default()
-                        }),
-                        // use_reference_composer_diff_prompt: Some(false),
-                        use_new_compression_scheme: Some(true),
-                        is_chat,
-                        conversation_id: msg_id.to_string(),
-                        environment_info: Some(environment_info),
-                        is_agentic,
-                        supported_tools: supported_tools.clone(),
-                        mcp_tools: tools
-                            .into_iter()
-                            .map(|tool| {
-                                let (name, description, parameters) = tool.extract();
-                                mcp_params::Tool {
-                                    server_name: ByteStr::from_static("custom"),
-                                    name: name.into(),
-                                    description: description.unwrap_or_default(),
-                                    parameters: __unwrap!(serde_json::to_string(&parameters))
-                                        .into(),
-                                }
-                            })
-                            .collect(),
-                        use_full_inputs_context: long_context.to_opt(),
-                        // is_resume: Some(false),
-                        allow_model_fallbacks: Some(false),
-                        // number_of_times_shown_fallback_model_warning: Some(0),
-                        unified_mode: Some(
-                            if is_agentic {
-                                stream_unified_chat_request::UnifiedMode::Agent
-                            } else {
-                                stream_unified_chat_request::UnifiedMode::Chat
-                            }
-                            .into(),
-                        ),
-                        // tools_requiring_accepted_return: supported_tools,
-                        should_disable_tools: Some(is_chat),
-                        thinking_level: Some(
-                            if model.is_thinking {
-                                stream_unified_chat_request::ThinkingLevel::High
-                            } else {
-                                stream_unified_chat_request::ThinkingLevel::Unspecified
-                            }
-                            .into(),
-                        ),
-                        uses_rules: Some(false),
-                        // mode_uses_auto_apply: Some(false),
-                        unified_mode_name: Some(ByteStr::from_static(if is_chat {
-                            ASK_MODE_NAME
-                        } else {
-                            AGENT_MODE_NAME
-                        })),
-                    }),
-                ),
+        let (conversation, full_conversation_headers_only) = messages.finalize();
+        let message = StreamUnifiedChatRequest {
+            conversation,
+            full_conversation_headers_only,
+            // allow_long_file_scan: Some(false),
+            explicit_context,
+            // can_handle_filenames_after_language_ids: Some(false),
+            model_details: Some(ModelDetails {
+                model_name: Some(model.id()),
+                azure_state: Some(AzureState::default()),
+                enable_slow_pool: enable_slow_pool.to_opt(),
+                max_mode: Some(model.max),
+            }),
+            use_web: if model.web { Some(ByteStr::from_static(WEB_SEARCH_MODE)) } else { None },
+            external_links,
+            should_cache: Some(true),
+            current_file: Some(CurrentFileInfo {
+                contents_start_at_line: 1,
+                cursor_position: Some(CursorPosition::default()),
+                total_number_of_lines: 1,
+                selection: Some(CursorRange {
+                    start_position: Some(CursorPosition::default()),
+                    end_position: Some(CursorPosition::default()),
+                }),
+                ..Default::default()
+            }),
+            // use_reference_composer_diff_prompt: Some(false),
+            use_new_compression_scheme: Some(true),
+            is_chat,
+            conversation_id: msg_id.to_string(),
+            environment_info: Some(environment_info),
+            is_agentic,
+            supported_tools: supported_tools.clone(),
+            mcp_tools: tools
+                .into_iter()
+                .map(|tool| {
+                    let (name, description, parameters) = tool.extract();
+                    mcp_params::Tool {
+                        server_name: ByteStr::from_static("custom"),
+                        name: name.into(),
+                        description: description.unwrap_or_default(),
+                        parameters: __unwrap!(sonic_rs::to_string(&parameters)).into(),
+                    }
+                })
+                .collect(),
+            use_full_inputs_context: long_context.to_opt(),
+            // is_resume: Some(false),
+            allow_model_fallbacks: Some(false),
+            // number_of_times_shown_fallback_model_warning: Some(0),
+            unified_mode: Some(
+                if is_agentic {
+                    stream_unified_chat_request::UnifiedMode::Agent
+                } else {
+                    stream_unified_chat_request::UnifiedMode::Chat
+                }
+                .into(),
             ),
-        };
+            // tools_requiring_accepted_return: supported_tools,
+            should_disable_tools: Some(is_chat),
+            thinking_level: Some(
+                if model.is_thinking {
+                    stream_unified_chat_request::ThinkingLevel::High
+                } else {
+                    stream_unified_chat_request::ThinkingLevel::Unspecified
+                }
+                .into(),
+            ),
+            uses_rules: Some(false),
+            // mode_uses_auto_apply: Some(false),
+            unified_mode_name: Some(ByteStr::from_static(if is_chat {
+                ASK_MODE_NAME
+            } else {
+                AGENT_MODE_NAME
+            })),
+        }
+        .into();
 
         // crate::debug!("send: {message:#?}");
 
         Ok(message)
     }
     async fn encode_tool_result(
-        tool_result: Self::ToolResult,
-        tool_call_id: ByteStr,
-        tool_name: ByteStr,
+        tool_result: ToolResult<Self::ToolContent>,
     ) -> Result<StreamUnifiedChatRequestWithTools, AdapterError> {
-        let result = tool_result.result().await?;
-        let tool_id = ToolId::parse(tool_call_id);
-        Ok(StreamUnifiedChatRequestWithTools {
-            request: Some(stream_unified_chat_request_with_tools::Request::ClientSideToolV2Result(
-                Box::new(ClientSideToolV2Result {
-                    tool: ClientSideToolV2::Mcp.into(),
-                    tool_call_id: tool_id.tool_call_id,
-                    model_call_id: tool_id.model_call_id,
-                    tool_index: None,
-                    result: Some(client_side_tool_v2_result::Result::McpResult(McpResult {
-                        selected_tool: tool_name,
-                        result,
-                    })),
-                }),
-            )),
-        })
+        let result = tool_result.content.result().await?;
+        let tool_id = ToolId::parse(&tool_result.id);
+        Ok(ClientSideToolV2Result {
+            tool: ClientSideToolV2::Mcp.into(),
+            tool_call_id: tool_id.tool_call_id,
+            model_call_id: tool_id.model_call_id,
+            tool_index: None,
+            result: Some(client_side_tool_v2_result::Result::McpResult(McpResult {
+                selected_tool: tool_result.name,
+                result,
+            })),
+        }
+        .into())
+    }
+    async fn encode_tool_results(
+        tool_results: Vec<ToolResult<Self::ToolContent>>,
+    ) -> Result<Vec<u8>, AdapterError> {
+        let mut messages = Vec::with_capacity(tool_results.len());
+        for tool_result in tool_results {
+            messages.push(Self::encode_tool_result(tool_result).await?);
+        }
+        encode_messages_framed(&messages).map_err(Into::into)
     }
 }
 
@@ -265,8 +262,8 @@ pub(super) trait ToByteStr: Sized {
 impl ToByteStr for uuid::Uuid {
     #[inline(always)]
     fn to_byte_str(&self) -> ByteStr {
-        let mut buffer = [0; 36];
+        let mut buffer = vec![0; 36];
         self.as_hyphenated().encode_lower(&mut buffer);
-        unsafe { ByteStr::from_utf8_unchecked(bytes::Bytes::copy_from_slice(&buffer)) }
+        unsafe { ByteStr::from_utf8_unchecked(bytes::Bytes::from(buffer)) }
     }
 }

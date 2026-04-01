@@ -1,18 +1,23 @@
+use super::{
+    AuthError, auth,
+    utils::{get_environment_info, get_token_bundle},
+};
+use crate::{
+    app::{
+        constant::AUTHORIZATION_BEARER_PREFIX,
+        lazy::AUTH_TOKEN,
+        model::{AppState, DateTime, QueueType},
+    },
+    core::config::KeyConfigBuilder,
+};
 use alloc::sync::Arc;
-
-use axum::body::Body;
-use axum::extract::State;
-use axum::middleware::Next;
-use axum::response::{IntoResponse as _, Response};
-use http::Request;
-use http::header::AUTHORIZATION;
-
-use super::utils::{get_environment_info, get_token_bundle};
-use super::{AuthError, auth};
-use crate::app::constant::AUTHORIZATION_BEARER_PREFIX;
-use crate::app::lazy::AUTH_TOKEN;
-use crate::app::model::{AppState, DateTime, QueueType};
-use crate::core::config::KeyConfigBuilder;
+use axum::{
+    body::Body,
+    extract::State,
+    middleware::Next,
+    response::{IntoResponse as _, Response},
+};
+use http::{Request, header::AUTHORIZATION};
 
 // 管理员认证中间件函数
 pub async fn admin_auth_middleware(request: Request<Body>, next: Next) -> Response {
@@ -63,18 +68,7 @@ pub async fn v1_auth_middleware(
         }
     };
 
-    // let (parts, body) = request.into_parts();
-
-    // let body = Body::from_stream(body.into_data_stream().map(move |c| {
-    //     if let Ok(ref b) = c {
-    //         crate::debug!("{:?}", unsafe { str::from_utf8_unchecked(b) });
-    //     }
-    //     c
-    // }));
-
-    // let request = Request::from_parts(parts, body);
-
-    next.run(request).await
+    next.run(request.map(debugging)).await.map(debugging)
 }
 
 pub async fn v1_auth2_middleware(
@@ -110,18 +104,7 @@ pub async fn v1_auth2_middleware(
         }
     };
 
-    // let (parts, body) = request.into_parts();
-
-    // let body = Body::from_stream(body.into_data_stream().map(move |c| {
-    //     if let Ok(ref b) = c {
-    //         crate::debug!("{:?}", unsafe { str::from_utf8_unchecked(b) });
-    //     }
-    //     c
-    // }));
-
-    // let request = Request::from_parts(parts, body);
-
-    next.run(request).await
+    next.run(request.map(debugging)).await.map(debugging)
 }
 
 pub async fn cpp_auth_middleware(
@@ -148,5 +131,26 @@ pub async fn cpp_auth_middleware(
 
     request.extensions_mut().insert(v);
 
-    next.run(request).await
+    next.run(request.map(debugging)).await.map(debugging)
 }
+
+#[cfg(feature = "__detailed_debugging")]
+#[inline(always)]
+fn debugging(body: Body) -> Body {
+    use futures_util::StreamExt as _;
+    Body::from_stream(body.into_data_stream().map(move |c| {
+        match &c {
+            Ok(b) => {
+                crate::debug!("{:?}", unsafe { str::from_utf8_unchecked(b) });
+            }
+            Err(e) => {
+                crate::debug!("{:?}", e);
+            }
+        }
+        c
+    }))
+}
+
+#[cfg(not(feature = "__detailed_debugging"))]
+#[inline(always)]
+fn debugging(body: Body) -> Body { body }

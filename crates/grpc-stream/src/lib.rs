@@ -41,6 +41,6 @@ pub use decoder::StreamDecoder;
 
 // 常量
 /// 最大解压缩消息大小限制（4 MiB）
-/// 
+///
 /// 对齐gRPC标准的默认最大消息大小，防止内存滥用攻击
 pub const MAX_DECOMPRESSED_SIZE_BYTES: usize = 0x400000; // 4 * 1024 * 1024

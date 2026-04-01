@@ -1,7 +1,6 @@
+use super::*;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-
-use super::*;
 
 impl serde_core::Serialize for ByteStr {
     #[inline]

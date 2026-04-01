@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 
 type HashMap<K, V> = hashbrown::HashMap<K, V, ahash::RandomState>;
 
-pub struct GetLogsParams {
+pub struct LogQuery {
     pub token_key: Option<TokenKey>,
     pub log_status: Option<LogStatus>,
     pub membership_type: Option<MembershipType>,
@@ -32,19 +32,15 @@ pub struct GetLogsParams {
     pub limit: usize,
 }
 
-// 定义发送给日志Actor的命令
 pub enum LogCommand {
-    // 获取日志
     GetLogs {
-        params: GetLogsParams,
+        params: LogQuery,
         tx: oneshot::Sender<(u64, Vec<RequestLog>)>,
     },
-    // 添加一条日志
     AddLog {
         log: Box<RequestLog>,
         token: ExtToken,
     },
-    // 获取下一个日志ID
     GetNextLogId {
         tx: oneshot::Sender<u64>,
     },
@@ -59,19 +55,18 @@ pub enum LogCommand {
     CloneToSave {
         tx: oneshot::Sender<super::LogManagerHelper>,
     },
-    // 更新指定ID的日志
     UpdateLog {
         id: u64,
-        ops: LogUpdate,
+        patch: LogPatch,
     },
 }
 
-pub enum LogUpdate {
+pub enum LogPatch {
     TokenProfile(Option<UserProfile>, Option<UsageProfile>, Option<StripeProfile>),
     Failure(ErrorInfo),
     Success,
     Timing(f64),
-    Failure2(ErrorInfo, f64),
+    FailureTimed(ErrorInfo, f64),
     Delays(Option<(String, Vec<(u32, f32)>)>, Option<String>),
     Usage(ChainUsage),
     TimingChain(f64, Chain),

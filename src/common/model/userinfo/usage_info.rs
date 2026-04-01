@@ -42,7 +42,9 @@ pub struct PlanUsage {
 /// 注意：`total`可能小于或等于`PlanUsage.limit`，其中：
 /// - `limit`是账户的总配额上限
 /// - `breakdown`记录已发放/统计的配额细分
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+#[derive(
+    Debug, Default, Clone, Copy, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize,
+)]
 pub struct UsageBreakdown {
     /// 基础包含配额
     pub included: i32,

@@ -40,7 +40,7 @@ RUN \
     # 组合 cargo features
     FEATURES="" && \
     if [ "$BUILD_PREVIEW" = "true" ]; then FEATURES="$FEATURES __preview_locked"; fi && \
-    if [ "$BUILD_COMPAT" = "true" ]; then FEATURES="$FEATURES __compat"; fi && \
+    if [ "$BUILD_COMPAT" != "true" ]; then FEATURES="$FEATURES __perf"; fi && \
     FEATURES=$(echo "$FEATURES" | xargs) && \
     \
     # 准备 RUSTFLAGS，兼容模式下移除特定 CPU 优化以获得更好的兼容性

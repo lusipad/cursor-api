@@ -14,11 +14,12 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 
 #[cfg(feature = "loom")]
 use loom::sync::atomic::AtomicUsize;
-use sdd::{AtomicShared, Epoch, Shared, Tag};
+use sdd::{AtomicRaw, Epoch, Owned, RawPtr};
 
 use super::hash_table::bucket::{Bucket, EntryPtr, INDEX};
 use super::hash_table::bucket_array::BucketArray;
 use super::hash_table::{HashTable, LockedBucket};
+use super::utils::{deref_unchecked, fake_ref, get_owned};
 use super::{Equivalent, Guard};
 
 /// Scalable asynchronous/concurrent hash index.
@@ -49,9 +50,9 @@ pub struct HashIndex<K, V, H = RandomState>
 where
     H: BuildHasher,
 {
-    bucket_array: AtomicShared<BucketArray<K, V, (), INDEX>>,
+    bucket_array: AtomicRaw<BucketArray<K, V, (), INDEX>>,
     build_hasher: H,
-    garbage_chain: AtomicShared<BucketArray<K, V, (), INDEX>>,
+    garbage_chain: AtomicRaw<BucketArray<K, V, (), INDEX>>,
     garbage_epoch: AtomicU8,
     minimum_capacity: AtomicUsize,
 }
@@ -134,9 +135,9 @@ where
     #[inline]
     pub const fn with_hasher(build_hasher: H) -> Self {
         Self {
-            bucket_array: AtomicShared::null(),
+            bucket_array: AtomicRaw::null(),
             build_hasher,
-            garbage_chain: AtomicShared::null(),
+            garbage_chain: AtomicRaw::null(),
             garbage_epoch: AtomicU8::new(u8::MAX),
             minimum_capacity: AtomicUsize::new(0),
         }
@@ -147,9 +148,9 @@ where
     #[inline]
     pub fn with_hasher(build_hasher: H) -> Self {
         Self {
-            bucket_array: AtomicShared::null(),
+            bucket_array: AtomicRaw::null(),
             build_hasher,
-            garbage_chain: AtomicShared::null(),
+            garbage_chain: AtomicRaw::null(),
             garbage_epoch: AtomicU8::new(u8::MAX),
             minimum_capacity: AtomicUsize::new(0),
         }
@@ -175,25 +176,56 @@ where
     #[inline]
     pub fn with_capacity_and_hasher(capacity: usize, build_hasher: H) -> Self {
         let (array, minimum_capacity) = if capacity == 0 {
-            (AtomicShared::null(), AtomicUsize::new(0))
+            (AtomicRaw::null(), AtomicUsize::new(0))
         } else {
-            let array = unsafe {
-                Shared::new_with_unchecked(|| {
-                    BucketArray::<K, V, (), INDEX>::new(capacity, AtomicShared::null())
+            let bucket_array = unsafe {
+                Owned::new_with_unchecked(|| {
+                    BucketArray::<K, V, (), INDEX>::new(capacity, AtomicRaw::null())
                 })
             };
-            let minimum_capacity = array.num_slots();
+            let minimum_capacity = bucket_array.num_slots();
             (
-                AtomicShared::from(array),
+                AtomicRaw::new(bucket_array.into_raw()),
                 AtomicUsize::new(minimum_capacity),
             )
         };
         Self {
             bucket_array: array,
             build_hasher,
-            garbage_chain: AtomicShared::null(),
+            garbage_chain: AtomicRaw::null(),
             garbage_epoch: AtomicU8::new(u8::MAX),
             minimum_capacity,
+        }
+    }
+
+    /// Deallocates garbage bucket arrays if they are unreachable.
+    fn dealloc_garbage(&self, force_collect: bool) {
+        let guard = Guard::new();
+        let head_ptr = self.garbage_chain.load(Acquire, &guard);
+        if head_ptr.is_null() {
+            return;
+        }
+        if force_collect
+            || Epoch::try_from(self.garbage_epoch.load(Acquire))
+                .is_ok_and(|e| !e.in_same_generation(guard.epoch()))
+        {
+            if self
+                .garbage_chain
+                .compare_exchange(head_ptr, RawPtr::null(), Acquire, Relaxed, &guard)
+                .is_ok()
+            {
+                let mut ptr = head_ptr;
+                while let Some(garbage_bucket_array) = get_owned(ptr) {
+                    ptr = garbage_bucket_array.linked_array_var().swap(
+                        RawPtr::null(),
+                        Acquire,
+                        &guard,
+                    );
+                    unsafe { garbage_bucket_array.drop_in_place() };
+                }
+            }
+        } else {
+            guard.set_has_garbage();
         }
     }
 }
@@ -1222,37 +1254,7 @@ where
     #[inline]
     fn reclaim_memory(&self) {
         if !self.garbage_chain.is_null(Acquire) {
-            self.dealloc_garbage();
-        }
-    }
-
-    /// Deallocates garbage bucket arrays if they are unreachable.
-    fn dealloc_garbage(&self) {
-        let guard = Guard::new();
-        let head_ptr = self.garbage_chain.load(Acquire, &guard);
-        if head_ptr.is_null() {
-            return;
-        }
-        let garbage_epoch = self.garbage_epoch.load(Acquire);
-        if Epoch::try_from(garbage_epoch).is_ok_and(|e| !e.in_same_generation(guard.epoch())) {
-            if let Ok((mut garbage_head, _)) = self.garbage_chain.compare_exchange(
-                head_ptr,
-                (None, Tag::None),
-                Acquire,
-                Relaxed,
-                &guard,
-            ) {
-                while let Some(garbage_bucket_array) = garbage_head {
-                    garbage_head = garbage_bucket_array
-                        .linked_array_var()
-                        .swap((None, Tag::None), Acquire)
-                        .0;
-                    let dropped = unsafe { garbage_bucket_array.drop_in_place() };
-                    debug_assert!(dropped);
-                }
-            }
-        } else {
-            guard.set_has_garbage();
+            self.dealloc_garbage(false);
         }
     }
 }
@@ -1361,23 +1363,14 @@ where
 {
     #[inline]
     fn drop(&mut self) {
-        self.bucket_array
-            .swap((None, Tag::None), Relaxed)
-            .0
-            .map(|a| unsafe {
+        if let Some(bucket_array) = get_owned(self.bucket_array.load(Acquire, fake_ref(self))) {
+            unsafe {
                 // The entire array does not need to wait for an epoch change as no references will
-                // remain outside the lifetime of the `HashIndex`.
-                a.drop_in_place()
-            });
-        let mut garbage_head = self.garbage_chain.swap((None, Tag::None), Acquire).0;
-        while let Some(garbage_bucket_array) = garbage_head {
-            garbage_head = garbage_bucket_array
-                .linked_array_var()
-                .swap((None, Tag::None), Acquire)
-                .0;
-            let dropped = unsafe { garbage_bucket_array.drop_in_place() };
-            debug_assert!(dropped);
+                // remain outside the lifetime of the `HashCache`.
+                bucket_array.drop_in_place();
+            }
         }
+        self.dealloc_garbage(true);
         for _ in 0..4 {
             Guard::new().accelerate();
         }
@@ -1414,24 +1407,25 @@ where
     }
 
     #[inline]
-    fn defer_reclaim(&self, bucket_array: Shared<BucketArray<K, V, (), INDEX>>, guard: &Guard) {
+    fn defer_reclaim(&self, bucket_array: Owned<BucketArray<K, V, (), INDEX>>, guard: &Guard) {
         guard.accelerate();
         self.reclaim_memory();
         self.garbage_epoch.swap(u8::from(guard.epoch()), Release);
-        let (Some(prev_head), _) = self
-            .garbage_chain
-            .swap((Some(bucket_array.clone()), Tag::None), AcqRel)
+        let bucket_array_ptr = bucket_array.into_raw();
+        let Some(prev_head) = get_owned(self.garbage_chain.swap(bucket_array_ptr, AcqRel, guard))
         else {
             return;
         };
         // The bucket array will be dropped when the epoch enters the next generation.
-        bucket_array
-            .linked_array_var()
-            .swap((Some(prev_head), Tag::None), Release);
+        if let Some(bucket_array) = deref_unchecked(bucket_array_ptr) {
+            bucket_array
+                .linked_array_var()
+                .swap(prev_head.into_raw(), Release, guard);
+        }
     }
 
     #[inline]
-    fn bucket_array_var(&self) -> &AtomicShared<BucketArray<K, V, (), INDEX>> {
+    fn bucket_array_var(&self) -> &AtomicRaw<BucketArray<K, V, (), INDEX>> {
         &self.bucket_array
     }
 
@@ -2134,6 +2128,26 @@ where
     }
 }
 
+impl<'h, K, V, H> Iter<'h, K, V, H>
+where
+    K: Eq + Hash,
+    H: BuildHasher,
+{
+    /// Starts iteration.
+    fn start(&mut self) -> Option<&'h BucketArray<K, V, (), INDEX>> {
+        // Start scanning.
+        let current_array = self.hashindex.bucket_array(self.guard)?;
+        let array = if let Some(old_array) = current_array.linked_array(self.guard) {
+            old_array
+        } else {
+            current_array
+        };
+        self.bucket_array.replace(array);
+        self.bucket.replace(array.bucket(0));
+        Some(array)
+    }
+}
+
 impl<K, V, H> Debug for Iter<'_, K, V, H>
 where
     K: Eq + Hash,
@@ -2142,8 +2156,8 @@ where
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Iter")
-            .field("current_bucket_index", &self.index)
-            .field("current_position_in_bucket", &self.entry_ptr.pos())
+            .field("bucket_index", &self.index)
+            .field("position_in_bucket", &self.entry_ptr.pos())
             .finish()
     }
 }
@@ -2157,29 +2171,19 @@ where
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        let mut array = if let Some(&array) = self.bucket_array.as_ref() {
+        let mut array = if let Some(array) = self.bucket_array {
             array
         } else {
-            // Start scanning.
-            let current_array = self.hashindex.bucket_array(self.guard)?;
-            let array = if let Some(old_array) = current_array.linked_array(self.guard) {
-                old_array
-            } else {
-                current_array
-            };
-            self.bucket_array.replace(array);
-            self.bucket.replace(array.bucket(0));
-            array
+            self.start()?
         };
 
         // Move to the next entry.
         loop {
-            if let Some(bucket) = self.bucket.take() {
+            if let Some(bucket) = self.bucket {
                 // Move to the next entry in the bucket.
                 if self.entry_ptr.find_next(bucket) {
                     let k = self.entry_ptr.key(array.data_block(self.index));
                     let v = self.entry_ptr.val(array.data_block(self.index));
-                    self.bucket.replace(bucket);
                     return Some((k, v));
                 }
             }
@@ -2189,31 +2193,22 @@ where
                 // Move to a newer bucket array.
                 self.index = 0;
                 let current_array = self.hashindex.bucket_array(self.guard)?;
-                if self
-                    .bucket_array
-                    .as_ref()
-                    .is_some_and(|&a| ptr::eq(a, current_array))
-                {
+                if self.bucket_array.is_some_and(|a| ptr::eq(a, current_array)) {
                     // Finished scanning.
+                    self.bucket.take();
                     break;
                 }
 
-                array = if let Some(old_array) = current_array.linked_array(self.guard) {
-                    if self
-                        .bucket_array
-                        .as_ref()
-                        .is_some_and(|&a| ptr::eq(a, old_array))
-                    {
+                if let Some(old_array) = current_array.linked_array(self.guard) {
+                    if self.bucket_array.is_some_and(|a| ptr::eq(a, old_array)) {
                         // Start scanning the current array.
                         array = current_array;
-                        self.bucket_array.replace(current_array);
-                        self.bucket.replace(current_array.bucket(0));
-                        continue;
+                    } else {
+                        array = old_array;
                     }
-                    old_array
                 } else {
-                    current_array
-                };
+                    array = current_array;
+                }
 
                 self.bucket_array.replace(array);
                 self.bucket.replace(array.bucket(0));

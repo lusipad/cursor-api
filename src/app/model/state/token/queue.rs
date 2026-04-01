@@ -5,6 +5,8 @@ use crate::{
     app::model::{ExtToken, TokenKey},
     common::utils::now_secs,
 };
+#[cfg(feature = "horizon")]
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(
@@ -183,7 +185,7 @@ impl TokenQueue {
     pub fn remove(
         &mut self,
         token_key: &TokenKey,
-        tokens: &[Option<super::TokenInfo>],
+        tokens: &[MaybeUninit<super::TokenInfo>],
     ) -> Option<usize> {
         let vec_index = self.map.remove(token_key)?;
 
@@ -209,13 +211,8 @@ impl TokenQueue {
         unsafe {
             let base = self.vec.as_mut_ptr().add(vec_index);
             for i in 0..(self.vec.len() - vec_index) {
-                let key = tokens
-                    .get_unchecked(*base.add(i))
-                    .as_ref()
-                    .unwrap_unchecked()
-                    .bundle
-                    .primary_token
-                    .key();
+                let key =
+                    tokens.get_unchecked(*base.add(i)).assume_init_ref().bundle.primary_token.key();
                 *self.map.get_mut(&key).unwrap_unchecked() = vec_index + i;
             }
         }
@@ -274,8 +271,7 @@ impl TokenQueue {
             };
             #[cfg(feature = "horizon")]
             let token = {
-                let token =
-                    unsafe { manager.tokens.get_unchecked(mgr_key).as_ref().unwrap_unchecked() };
+                let token = unsafe { manager.tokens.get_unchecked(mgr_key).assume_init_ref() };
 
                 if !token.is_enabled() || !token.status.health.is_available() {
                     continue;

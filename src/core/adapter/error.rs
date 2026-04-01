@@ -126,9 +126,7 @@ impl Error {
 
     /// Converts to HTTP response tuple
     #[inline]
-    pub const fn into_response_tuple(
-        self,
-    ) -> (http::StatusCode, InfallibleJson<GenericError>) {
+    pub const fn into_response_tuple(self) -> (http::StatusCode, InfallibleJson<GenericError>) {
         let (status_code, error, message) = self.to_parts();
         (
             status_code,
@@ -159,9 +157,7 @@ impl Error {
 
     /// Converts to Anthropic error format
     #[inline]
-    pub const fn into_anthropic_tuple(
-        self,
-    ) -> (http::StatusCode, InfallibleJson<AnthropicError>) {
+    pub const fn into_anthropic_tuple(self) -> (http::StatusCode, InfallibleJson<AnthropicError>) {
         let (status_code, code, message) = self.to_parts();
         (
             status_code,

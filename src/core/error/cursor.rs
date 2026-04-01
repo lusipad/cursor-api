@@ -92,7 +92,7 @@ impl CursorError {
     }
 
     #[inline]
-    pub fn from_slice(v: &[u8]) -> Result<Self, serde_json::Error> { serde_json::from_slice(v) }
+    pub fn from_slice(v: &[u8]) -> Result<Self, sonic_rs::Error> { sonic_rs::from_slice(v) }
 }
 
 impl From<CursorError> for CanonicalError {

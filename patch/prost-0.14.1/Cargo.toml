@@ -50,7 +50,7 @@ std = []
 indexmap = ["dep:indexmap"]
 
 [dependencies]
-byte_str = { version = "0.1.0", path = "../../crates/byte_str", default-features = false }
+byte_str = { version = "0.1.0", path = "../../crates/byte_str" }
 bytes = { version = "1", default-features = false }
 indexmap = { version = "2.12.1", default-features = false, optional = true }
 prost-derive = { version = "0.14.3", path = "../prost-derive", optional = true }

@@ -9,11 +9,11 @@ pub struct ToolId {
 }
 
 impl ToolId {
-    pub fn parse(s: ByteStr) -> Self {
+    pub fn parse(s: &ByteStr) -> Self {
         if let Some((tool_call_id, model_call_id)) = s.split_once(DELIMITER) {
             Self { tool_call_id, model_call_id: Some(model_call_id) }
         } else {
-            Self { tool_call_id: s, model_call_id: None }
+            Self { tool_call_id: s.clone(), model_call_id: None }
         }
     }
     pub fn format(tool_call_id: ByteStr, model_call_id: Option<ByteStr>) -> ByteStr {

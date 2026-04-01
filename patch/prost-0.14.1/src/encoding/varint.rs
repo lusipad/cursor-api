@@ -30,6 +30,9 @@ pub const fn decode_zigzag64(value: u64) -> i64 {
 
 /// The maximum number of bytes a Protobuf Varint can occupy.
 const VARINT64_MAX_LEN: usize = 10;
+/// In a 10-byte `u64` varint, the first 9 bytes contribute 63 payload bits,
+/// so the last byte may carry only the remaining 1 bit.
+const VARINT64_LAST_BYTE_MAX: u8 = (u64::MAX >> ((VARINT64_MAX_LEN - 1) * 7)) as u8;
 
 /// Encodes an integer value into LEB128 variable length format, and writes it to the buffer.
 ///
@@ -147,7 +150,7 @@ fn decode_varint64_fast(bytes: &[u8]) -> Option<(u64, usize)> {
 
         if byte < 0x80 {
             // Check for overlong encoding on the 10th byte.
-            if unlikely(i == 9 && byte > 1) {
+            if unlikely(i == 9 && byte > VARINT64_LAST_BYTE_MAX) {
                 return None;
             }
             return Some((value, i + 1));
@@ -176,7 +179,7 @@ fn decode_varint64_slow(buf: &mut impl Buf) -> Option<u64> {
 
         if byte < 0x80 {
             // Check for overlong encoding on the 10th byte.
-            if unlikely(i == 9 && byte > 1) {
+            if unlikely(i == 9 && byte > VARINT64_LAST_BYTE_MAX) {
                 return None;
             }
             return Some(value);
@@ -189,6 +192,9 @@ fn decode_varint64_slow(buf: &mut impl Buf) -> Option<u64> {
 
 /// The maximum number of bytes a Protobuf Varint can occupy.
 const VARINT32_MAX_LEN: usize = 5;
+/// In a 5-byte `u32` varint, the first 4 bytes contribute 28 payload bits,
+/// so the last byte may carry only the remaining 4 bits.
+const VARINT32_LAST_BYTE_MAX: u8 = (u32::MAX >> ((VARINT32_MAX_LEN - 1) * 7)) as u8;
 
 /// Encodes an integer value into LEB128 variable length format, and writes it to the buffer.
 ///
@@ -307,7 +313,7 @@ fn decode_varint32_fast(bytes: &[u8]) -> Option<(u32, usize)> {
 
         if byte < 0x80 {
             // Check for overlong encoding on the 5th byte.
-            if unlikely(i == 4 && byte > 4) {
+            if unlikely(i == 4 && byte > VARINT32_LAST_BYTE_MAX) {
                 return None;
             }
             return Some((value, i + 1));
@@ -336,7 +342,7 @@ fn decode_varint32_slow(buf: &mut impl Buf) -> Option<u32> {
 
         if byte < 0x80 {
             // Check for overlong encoding on the 5th byte.
-            if unlikely(i == 4 && byte > 4) {
+            if unlikely(i == 4 && byte > VARINT32_LAST_BYTE_MAX) {
                 return None;
             }
             return Some(value);

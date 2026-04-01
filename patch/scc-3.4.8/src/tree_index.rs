@@ -14,9 +14,9 @@ use std::panic::UnwindSafe;
 use std::pin::pin;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
 
-use sdd::{AtomicShared, Ptr, Shared, Tag};
+use sdd::{AtomicRaw, Owned, RawPtr};
 
-use crate::utils::{AsyncPager, deref_unchecked, drop_in_place};
+use crate::utils::{AsyncPager, deref_unchecked, get_owned, likely};
 use crate::{Comparable, Guard};
 use leaf::Iter as LeafIter;
 use leaf::RevIter as LeafRevIter;
@@ -65,7 +65,7 @@ use node::Node;
 /// [`TreeIndex`] is impervious to out-of-memory errors and panics in user-specified code under one
 /// condition; `K::drop` and `V::drop` must not panic.
 pub struct TreeIndex<K, V> {
-    root: AtomicShared<Node<K, V>>,
+    root: AtomicRaw<Node<K, V>>,
 }
 
 /// An iterator over the entries of a [`TreeIndex`].
@@ -73,7 +73,7 @@ pub struct TreeIndex<K, V> {
 /// An [`Iter`] iterates over all the entries that exist during the lifetime of the [`Iter`] in
 /// monotonically increasing order.
 pub struct Iter<'t, 'g, K, V> {
-    root: &'t AtomicShared<Node<K, V>>,
+    root: &'t AtomicRaw<Node<K, V>>,
     forward: Option<LeafIter<'g, K, V>>,
     backward: Option<LeafRevIter<'g, K, V>>,
     guard: &'g Guard,
@@ -81,7 +81,7 @@ pub struct Iter<'t, 'g, K, V> {
 
 /// An iterator over a sub-range of entries in a [`TreeIndex`].
 pub struct Range<'t, 'g, K, V, Q: ?Sized, R: RangeBounds<Q>> {
-    root: &'t AtomicShared<Node<K, V>>,
+    root: &'t AtomicRaw<Node<K, V>>,
     forward: Option<LeafIter<'g, K, V>>,
     backward: Option<LeafRevIter<'g, K, V>>,
     bounds: R,
@@ -131,7 +131,7 @@ impl<K, V> TreeIndex<K, V> {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            root: AtomicShared::null(),
+            root: AtomicRaw::null(),
         }
     }
 
@@ -141,7 +141,7 @@ impl<K, V> TreeIndex<K, V> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            root: AtomicShared::null(),
+            root: AtomicRaw::null(),
         }
     }
 
@@ -159,11 +159,13 @@ impl<K, V> TreeIndex<K, V> {
     /// ```
     #[inline]
     pub fn clear(&self) {
-        let Some(root) = self.root.swap((None, Tag::None), Acquire).0 else {
+        let guard = Guard::new();
+        let root_ptr = self.root.swap(RawPtr::null(), Acquire, &guard);
+        let Some(root) = deref_unchecked(root_ptr) else {
             return;
         };
-        let guard = Guard::new();
         root.clear(&guard);
+        drop(get_owned(root_ptr));
         guard.accelerate();
     }
 
@@ -230,15 +232,16 @@ where
                             val = v;
                         }
                     }
-                } else if let Err((Some(new_node), _)) = self.root.compare_exchange(
-                    Ptr::null(),
-                    (Some(Shared::new_with(Node::new_leaf_node)), Tag::None),
-                    AcqRel,
-                    Acquire,
-                    &guard,
-                ) {
-                    drop_in_place(new_node);
-                    continue;
+                } else {
+                    let new_root_ptr = Owned::new_with(Node::new_leaf_node).into_raw();
+                    if self
+                        .root
+                        .compare_exchange(RawPtr::null(), new_root_ptr, AcqRel, Acquire, &guard)
+                        .is_err()
+                    {
+                        drop(get_owned(new_root_ptr));
+                        continue;
+                    }
                 }
             };
             pinned_pager.wait().await;
@@ -285,14 +288,15 @@ where
                         val = v;
                     }
                 }
-            } else if let Err((Some(new_node), _)) = self.root.compare_exchange(
-                Ptr::null(),
-                (Some(Shared::new_with(Node::new_leaf_node)), Tag::None),
-                AcqRel,
-                Acquire,
-                &guard,
-            ) {
-                drop_in_place(new_node);
+            } else {
+                let new_root_ptr = Owned::new_with(Node::new_leaf_node).into_raw();
+                if self
+                    .root
+                    .compare_exchange(RawPtr::null(), new_root_ptr, AcqRel, Acquire, &guard)
+                    .is_err()
+                {
+                    drop(get_owned(new_root_ptr));
+                }
             }
         }
     }
@@ -1178,25 +1182,23 @@ impl<'t, 'g, K, V> Iter<'t, 'g, K, V> {
     /// ```
     #[inline]
     pub const fn flip(&mut self) -> bool {
-        if self.backward.is_none()
-            && self.get().is_some()
-            && let Some(forward) = self.forward.take()
-        {
-            self.backward = Some(forward.rev());
-            return true;
+        if self.backward.is_none() && self.get().is_some() {
+            if let Some(forward) = self.forward.take() {
+                self.backward = Some(forward.rev());
+                return true;
+            }
         }
-        if self.forward.is_none()
-            && self.get_back().is_some()
-            && let Some(backward) = self.backward.take()
-        {
-            self.forward = Some(backward.rev());
-            return true;
+        if self.forward.is_none() && self.get_back().is_some() {
+            if let Some(backward) = self.backward.take() {
+                self.forward = Some(backward.rev());
+                return true;
+            }
         }
         self.forward.is_none() && self.backward.is_none()
     }
 
     #[inline]
-    const fn new(root: &'t AtomicShared<Node<K, V>>, guard: &'g Guard) -> Iter<'t, 'g, K, V> {
+    const fn new(root: &'t AtomicRaw<Node<K, V>>, guard: &'g Guard) -> Iter<'t, 'g, K, V> {
         Iter::<'t, 'g, K, V> {
             root,
             forward: None,
@@ -1274,14 +1276,14 @@ where
         // Go to the prev entry.
         if let Some(rev_iter) = self.backward.as_mut() {
             if let Some(entry) = rev_iter.next() {
-                if self.forward.is_none() {
+                if likely(self.forward.is_none()) {
                     return Some(entry);
                 }
                 return self.check_collision::<false>(entry);
             }
             // Go to the prev leaf node.
             if let Some(entry) = rev_iter.jump(self.guard) {
-                if self.forward.is_none() {
+                if likely(self.forward.is_none()) {
                     return Some(entry);
                 }
                 return self.check_collision::<false>(entry);
@@ -1315,14 +1317,14 @@ where
         // Go to the next entry.
         if let Some(iter) = self.forward.as_mut() {
             if let Some(entry) = iter.next() {
-                if self.backward.is_none() {
+                if likely(self.backward.is_none()) {
                     return Some(entry);
                 }
                 return self.check_collision::<true>(entry);
             }
             // Go to the next leaf node.
             if let Some(entry) = iter.jump(self.guard) {
-                if self.backward.is_none() {
+                if likely(self.backward.is_none()) {
                     return Some(entry);
                 }
                 return self.check_collision::<true>(entry);
@@ -1364,7 +1366,7 @@ impl<K, V> UnwindSafe for Iter<'_, '_, K, V> {}
 impl<'t, 'g, K, V, Q: ?Sized, R: RangeBounds<Q>> Range<'t, 'g, K, V, Q, R> {
     #[inline]
     const fn new(
-        root: &'t AtomicShared<Node<K, V>>,
+        root: &'t AtomicRaw<Node<K, V>>,
         range: R,
         guard: &'g Guard,
     ) -> Range<'t, 'g, K, V, Q, R> {
@@ -1486,27 +1488,25 @@ where
     /// ```
     #[inline]
     pub fn flip(&mut self) -> bool {
-        if self.backward.is_none()
-            && self.get().is_some()
-            && let Some(forward) = self.forward.take()
-        {
-            let backward = forward.rev();
-            let min_key = backward.min_key();
-            self.backward = Some(backward);
-            self.check_upper_bound = false;
-            self.set_check_lower_bound(min_key);
-            return true;
+        if self.backward.is_none() && self.get().is_some() {
+            if let Some(forward) = self.forward.take() {
+                let backward = forward.rev();
+                let min_key = backward.min_key();
+                self.backward = Some(backward);
+                self.check_upper_bound = false;
+                self.set_check_lower_bound(min_key);
+                return true;
+            }
         }
-        if self.forward.is_none()
-            && self.get_back().is_some()
-            && let Some(backward) = self.backward.take()
-        {
-            let forward = backward.rev();
-            let max_key = forward.max_key();
-            self.forward = Some(forward);
-            self.check_lower_bound = false;
-            self.set_check_upper_bound(max_key);
-            return true;
+        if self.forward.is_none() && self.get_back().is_some() {
+            if let Some(backward) = self.backward.take() {
+                let forward = backward.rev();
+                let max_key = forward.max_key();
+                self.forward = Some(forward);
+                self.check_lower_bound = false;
+                self.set_check_upper_bound(max_key);
+                return true;
+            }
         }
         self.forward.is_none() && self.backward.is_none()
     }
@@ -1741,7 +1741,7 @@ where
             if self.check_lower_bound && !self.check_lower_bound(entry.0) {
                 return None;
             }
-            if self.forward.is_none() {
+            if likely(self.forward.is_none()) {
                 return Some(entry);
             }
             return self.check_collision::<false>(entry);
@@ -1764,7 +1764,7 @@ where
             if self.check_upper_bound && !self.check_upper_bound(entry.0) {
                 return None;
             }
-            if self.backward.is_none() {
+            if likely(self.backward.is_none()) {
                 return Some(entry);
             }
             return self.check_collision::<true>(entry);

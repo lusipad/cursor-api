@@ -3,6 +3,29 @@
 
 ## Version 3
 
+3.6.10
+
+* Micro optimization.
+
+3.6.9
+
+* Fix `MSRV` issues: affected versions = `[3.5.2, 3.6.8]`.
+* Add branch prediction hints for more predictable `HashIndex` and `TreeIndex` entry iteration performance.
+ 
+3.6.8
+
+* Minor `TreeIndex::drop` optimization.
+
+3.6.7
+
+* Bump dependencies.
+* Replace `sdd::AtomicShared` with `sdd::AtomicRaw` to minimize `RMW` operations.
+
+3.6.6
+
+* Minor ref-counting optimization.
+* `TreeIndex` parameter adjustment: `B: 14 -> 15`.
+
 3.6.5
 
 * Faster memory reclamation after dropping a container at the cost of slower `fn drop`.

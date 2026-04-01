@@ -1,7 +1,5 @@
+use crate::{app::constant::EMPTY_STRING, common::utils::parse_from_env};
 use alloc::borrow::Cow;
-
-use crate::app::constant::EMPTY_STRING;
-use crate::common::utils::parse_from_env;
 
 #[derive(Clone, Copy, PartialEq)]
 #[repr(u8)]
@@ -46,17 +44,13 @@ impl ModelIdSource {
 
 impl const Default for ModelIdSource {
     #[inline(always)]
-    fn default() -> Self {
-        Self::ServerId
-    }
+    fn default() -> Self { Self::ServerId }
 }
 
 impl ::serde::Serialize for ModelIdSource {
     #[inline]
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: ::serde::Serializer,
-    {
+    where S: ::serde::Serializer {
         serializer.serialize_str(self.as_str())
     }
 }

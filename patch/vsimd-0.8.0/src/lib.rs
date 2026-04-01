@@ -3,7 +3,7 @@
 #![cfg_attr(
     feature = "unstable",
     // feature(stdsimd),
-    feature(arm_target_feature),
+    // feature(arm_target_feature),
     feature(portable_simd),
     // feature(inline_const),
     // feature(array_chunks)

@@ -3,8 +3,7 @@ use crate::{
         constant::AUTHORIZATION_BEARER_PREFIX,
         lazy::AUTH_TOKEN,
         model::{
-            AppState, DateTime, ExtToken, GetLogsParams, LogStatus, RequestLog, TokenKey,
-            log_manager,
+            AppState, DateTime, ExtToken, LogQuery, LogStatus, RequestLog, TokenKey, log_manager,
         },
         route::{GenericJson, InfallibleJson, InfallibleSerialize},
     },
@@ -143,7 +142,7 @@ pub async fn handle_get_logs(
         )
     };
 
-    let params = GetLogsParams {
+    let params = LogQuery {
         token_key: user_token,
         log_status: status_enum,
         membership_type: membership_enum,

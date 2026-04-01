@@ -66,6 +66,10 @@ impl HeaderValue {
     #[inline(always)]
     pub const unsafe fn into(self) -> http::header::HeaderValue { unsafe { transmute(self) } }
     #[inline]
+    pub const fn new(bytes: impl [const] Into<bytes::Bytes>) -> Self {
+        Self { inner: bytes.into(), is_sensitive: false }
+    }
+    #[inline]
     pub const fn from_static(src: &'static str) -> HeaderValue {
         HeaderValue { inner: bytes::Bytes::from_static(src.as_bytes()), is_sensitive: false }
     }
@@ -100,9 +104,3 @@ impl From<String> for HeaderValue {
 
 #[inline]
 fn is_valid(b: u8) -> bool { b >= 32 && b != 127 || b == b'\t' }
-
-#[inline]
-pub fn is_default<T>(v: &T) -> bool
-where T: Default + PartialEq {
-    *v == T::default()
-}

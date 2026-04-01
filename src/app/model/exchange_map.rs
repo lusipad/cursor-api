@@ -36,14 +36,15 @@ impl TryFrom<HashMap<String, String>> for ExchangeMap {
 impl ExchangeMap {
     #[inline]
     pub fn resolve(&mut self, path: &'static str) -> &'static str {
-        let Some(path) = self.map.get(path) else { self.cache.insert(path); return path };
+        let Some(path) = self.map.get(path) else {
+            self.cache.insert(path);
+            return path;
+        };
         self.cache.get_or_insert_with(path.as_str(), |s| {
             let s: Box<str> = Box::from(s);
             Box::leak(s)
         })
     }
     #[inline]
-    pub fn finish(self) -> HashSet<&'static str> {
-        self.cache
-    }
+    pub fn finish(self) -> HashSet<&'static str> { self.cache }
 }

@@ -3,7 +3,6 @@
 #![feature(const_destruct)]
 #![feature(const_convert)]
 #![feature(const_cmp)]
-#![feature(partial_ord_chaining_methods)]
 #![cfg_attr(feature = "alloc", feature(allocator_api))]
 #![cfg_attr(not(feature = "std"), no_std)]
 

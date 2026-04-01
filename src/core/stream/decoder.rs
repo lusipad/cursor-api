@@ -4,10 +4,13 @@ pub mod types;
 mod utils;
 
 // use core::sync::atomic::{AtomicU32, Ordering};
-use crate::core::{
-    adapter::ToolId,
-    aiserver::v1::{StreamUnifiedChatResponseWithTools, WebReference},
-    error::{CursorError, StreamError},
+use crate::{
+    common::utils::hex,
+    core::{
+        adapter::ToolId,
+        aiserver::v1::{StreamUnifiedChatResponseWithTools, WebReference},
+        error::{CursorError, StreamError},
+    },
 };
 use alloc::borrow::Cow;
 use byte_str::ByteStr;
@@ -221,13 +224,18 @@ impl StreamDecoder {
             self.buffer.len() < 5
         } {
             self.empty_stream_count += 1;
-            let arg = if self.buffer.is_empty() {
-                format_args!("为空")
-            } else {
-                __cold_path!();
-                format_args!(": {}", hex::encode(&self.buffer))
-            };
-            crate::debug!("数据长度小于5字节，当前数据{arg}");
+            struct BufferDisplay<'a>(&'a [u8]);
+            impl<'a> ::core::fmt::Display for BufferDisplay<'a> {
+                fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                    if self.0.is_empty() {
+                        f.write_str("为空")
+                    } else {
+                        __cold_path!();
+                        write!(f, ": {}", hex::encode(self.0))
+                    }
+                }
+            }
+            crate::debug!("数据长度小于5字节，当前数据{}", BufferDisplay(self.buffer.as_ref()));
             return Err(StreamError::EmptyStream);
         }
 
@@ -338,137 +346,136 @@ impl StreamDecoder {
 
     fn handle_text_message(msg_data: &[u8], ctx: &mut Context) -> Option<StreamMessage> {
         // let count = self.counter.fetch_add(1, Ordering::SeqCst);
-        if let Ok(wrapper) = StreamUnifiedChatResponseWithTools::decode(msg_data) {
-            // crate::debug!("StreamUnifiedChatResponseWithTools [hex: {}]: {:#?}", hex::encode(msg_data), response);
-            // crate::debug!("{count}: {response:?}");
-            if let Some(response) = wrapper.response {
-                // crate::debug!("received: {response:#?}");
-                use super::super::aiserver::v1::{
-                    client_side_tool_v2_call::Params,
-                    stream_unified_chat_response_with_tools::Response,
-                };
-                match response {
-                    Response::ClientSideToolV2Call(response) => {
-                        let mut result = None;
-                        let mut finish = false;
+        let Ok(wrapper) = StreamUnifiedChatResponseWithTools::decode(msg_data) else {
+            return None;
+        };
+        // crate::debug!("StreamUnifiedChatResponseWithTools [hex: {}]: {:#?}", hex::encode(msg_data), response);
+        // crate::debug!("{count}: {response:?}");
+        if let Some(response) = wrapper.response {
+            // crate::debug!("received: {response:#?}");
+            use super::super::aiserver::v1::{
+                client_side_tool_v2_call::Params, stream_unified_chat_response_with_tools::Response,
+            };
+            match response {
+                Response::ClientSideToolV2Call(response) => {
+                    let mut result = None;
+                    let mut finish = false;
 
-                        // if !response.raw_args.is_empty() {
-                        //     crate::debug!("detected: {:?}", response.raw_args);
-                        // }
+                    // if !response.raw_args.is_empty() {
+                    //     crate::debug!("detected: {:?}", response.raw_args);
+                    // }
 
-                        if response.is_streaming {
-                            use core::cmp::Ordering;
+                    if response.is_streaming {
+                        use core::cmp::Ordering;
 
-                            if !utils::has_space_after_separator(response.raw_args.as_bytes()) {
+                        if !utils::has_space_after_separator(response.raw_args.as_bytes()) {
+                            return None;
+                        }
+
+                        let raw_args_len = response.raw_args.len();
+
+                        match raw_args_len.cmp(&ctx.raw_args_len) {
+                            Ordering::Greater => {
+                                // 有新增数据，提取增量部分
+                                let args =
+                                    unsafe { response.raw_args.get_unchecked(ctx.raw_args_len..) };
+
+                                if args.len() > INCREMENTAL_COPY_THRESHOLD {
+                                    __cold_path!();
+                                    // 大块数据：原地移动避免重新分配
+                                    let mut raw_args = response.raw_args;
+                                    let count = raw_args_len - ctx.raw_args_len;
+
+                                    unsafe {
+                                        let v = raw_args.as_mut_vec();
+                                        // SAFETY: the conditions for `ptr::copy` have all been checked above,
+                                        // as have those for `ptr::add`.
+                                        let ptr = v.as_mut_ptr();
+                                        let src_ptr = ptr.add(ctx.raw_args_len);
+                                        core::ptr::copy(src_ptr, ptr, count);
+                                        v.set_len(count);
+                                    }
+                                    result = Some(raw_args);
+                                } else {
+                                    // 小块数据：直接克隆更快
+                                    result = Some(args.to_owned());
+                                }
+
+                                ctx.raw_args_len = raw_args_len;
+                            }
+
+                            Ordering::Equal => {
+                                // 无新数据，跳过此次处理
                                 return None;
                             }
 
-                            let raw_args_len = response.raw_args.len();
-
-                            match raw_args_len.cmp(&ctx.raw_args_len) {
-                                Ordering::Greater => {
-                                    // 有新增数据，提取增量部分
-                                    let args = unsafe {
-                                        response.raw_args.get_unchecked(ctx.raw_args_len..)
-                                    };
-
-                                    if args.len() > INCREMENTAL_COPY_THRESHOLD {
-                                        __cold_path!();
-                                        // 大块数据：原地移动避免重新分配
-                                        let mut raw_args = response.raw_args;
-                                        let count = raw_args_len - ctx.raw_args_len;
-
-                                        unsafe {
-                                            let v = raw_args.as_mut_vec();
-                                            // SAFETY: the conditions for `ptr::copy` have all been checked above,
-                                            // as have those for `ptr::add`.
-                                            let ptr = v.as_mut_ptr();
-                                            let src_ptr = ptr.add(ctx.raw_args_len);
-                                            core::ptr::copy(src_ptr, ptr, count);
-                                            v.set_len(count);
-                                        }
-                                        result = Some(raw_args);
-                                    } else {
-                                        // 小块数据：直接克隆更快
-                                        result = Some(args.to_owned());
-                                    }
-
-                                    ctx.raw_args_len = raw_args_len;
-                                }
-
-                                Ordering::Equal => {
-                                    // 无新数据，跳过此次处理
-                                    return None;
-                                }
-
-                                Ordering::Less => {
-                                    __cold_path!();
-                                    eprintln!(
-                                        "Warning: raw_args_len decreased: {} < {} (possible stream reset)",
-                                        raw_args_len, ctx.raw_args_len
-                                    );
-                                    crate::debug!(
-                                        "Streaming length regression detected: \
-                                        raw_args={:?},
-                                        tool_call_id={}, model_call_id={}, \
-                                        expected_len={}, actual_len={}, \
-                                        delta={}, is_last={}",
-                                        response.raw_args,
-                                        response.tool_call_id,
-                                        response.model_call_id.as_deref().unwrap_or_default(),
-                                        ctx.raw_args_len,
-                                        raw_args_len,
-                                        ctx.raw_args_len as i64 - raw_args_len as i64,
-                                        response.is_last_message
-                                    );
-                                }
+                            Ordering::Less => {
+                                __cold_path!();
+                                eprintln!(
+                                    "Warning: raw_args_len decreased: {} < {} (possible stream reset)",
+                                    raw_args_len, ctx.raw_args_len
+                                );
+                                crate::debug!(
+                                    "Streaming length regression detected: \
+                                    raw_args={:?},
+                                    tool_call_id={}, model_call_id={}, \
+                                    expected_len={}, actual_len={}, \
+                                    delta={}, is_last={}",
+                                    response.raw_args,
+                                    response.tool_call_id,
+                                    response.model_call_id.as_deref().unwrap_or_default(),
+                                    ctx.raw_args_len,
+                                    raw_args_len,
+                                    ctx.raw_args_len as i64 - raw_args_len as i64,
+                                    response.is_last_message
+                                );
                             }
+                        }
 
-                            if response.is_last_message {
-                                finish = true;
-                            }
-                        } else {
-                            result = Some(response.raw_args);
+                        if response.is_last_message {
                             finish = true;
                         }
-
-                        if finish {
-                            ctx.processed += 1;
-                            ctx.raw_args_len = 0;
-                        }
-
-                        let id = ToolId::format(response.tool_call_id, response.model_call_id);
-                        let name = response
-                            .params
-                            .and_then(|ps| {
-                                let Params::McpParams(ps) = ps;
-                                ps.tools.into_iter().next()
-                            })
-                            .map(|tool| {
-                                if tool.server_name == *"custom" {
-                                    tool.name
-                                } else {
-                                    format!("mcp__{}__{}", tool.server_name, tool.name).into()
-                                }
-                            })
-                            .unwrap_or_default();
-
-                        return result.map(|input| {
-                            StreamMessage::ToolCall(ToolCall { id, name, input, is_last: finish })
-                        });
+                    } else {
+                        result = Some(response.raw_args);
+                        finish = true;
                     }
-                    Response::StreamUnifiedChatResponse(response) => {
-                        if !response.text.is_empty() {
-                            return Some(StreamMessage::Content(response.text));
-                        } else if let Some(thinking) = response.thinking {
-                            return Some(StreamMessage::Thinking(thinking.into()));
-                        }
-                        // else if let Some(filled_prompt) = response.filled_prompt {
-                        //     return Some(StreamMessage::Debug(filled_prompt));
-                        // }
-                        else if let Some(web_citation) = response.web_citation {
-                            return Some(StreamMessage::WebReference(web_citation.references));
-                        }
+
+                    if finish {
+                        ctx.processed += 1;
+                        ctx.raw_args_len = 0;
+                    }
+
+                    let id = ToolId::format(response.tool_call_id, response.model_call_id);
+                    let name = response
+                        .params
+                        .and_then(|ps| {
+                            let Params::McpParams(ps) = ps;
+                            ps.tools.into_iter().next()
+                        })
+                        .map(|tool| {
+                            if tool.server_name == *"custom" {
+                                tool.name
+                            } else {
+                                format!("mcp__{}__{}", tool.server_name, tool.name).into()
+                            }
+                        })
+                        .unwrap_or_default();
+
+                    return result.map(|input| {
+                        StreamMessage::ToolCall(ToolCall { id, name, input, is_last: finish })
+                    });
+                }
+                Response::StreamUnifiedChatResponse(response) => {
+                    if !response.text.is_empty() {
+                        return Some(StreamMessage::Content(response.text));
+                    } else if let Some(thinking) = response.thinking {
+                        return Some(StreamMessage::Thinking(thinking.into()));
+                    }
+                    // else if let Some(filled_prompt) = response.filled_prompt {
+                    //     return Some(StreamMessage::Debug(filled_prompt));
+                    // }
+                    else if let Some(web_citation) = response.web_citation {
+                        return Some(StreamMessage::WebReference(web_citation.references));
                     }
                 }
             }
@@ -489,6 +496,7 @@ impl StreamDecoder {
             // crate::debug!("received: {error:#?}");
             return Err(error);
         } else {
+            __cold_path!();
             crate::debug!("[JSON error] {}", hex::encode(msg_data));
         }
         // }

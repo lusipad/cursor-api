@@ -1,3 +1,4 @@
+// use crate::core::stream::hash_chain::{Buf, SerializeMessage};
 use core::num::NonZeroU16;
 
 // Include the generated Protobuf code
@@ -231,3 +232,95 @@ impl AvailableModelsResponse {
         })
     }
 }
+
+impl From<StreamUnifiedChatRequest> for StreamUnifiedChatRequestWithTools {
+    #[inline]
+    fn from(request: StreamUnifiedChatRequest) -> Self {
+        StreamUnifiedChatRequestWithTools {
+            request: Some(
+                stream_unified_chat_request_with_tools::Request::StreamUnifiedChatRequest(
+                    Box::new(request),
+                ),
+            ),
+        }
+    }
+}
+
+impl From<ClientSideToolV2Result> for StreamUnifiedChatRequestWithTools {
+    #[inline]
+    fn from(result: ClientSideToolV2Result) -> Self {
+        StreamUnifiedChatRequestWithTools {
+            request: Some(stream_unified_chat_request_with_tools::Request::ClientSideToolV2Result(
+                Box::new(result),
+            )),
+        }
+    }
+}
+
+// impl client_side_tool_v2_result::Result {
+//     #[inline]
+//     fn as_ref(&self) -> &::byte_str::ByteStr {
+//         let Self::McpResult(McpResult { result, .. }) = self;
+//         result
+//     }
+// }
+
+// impl SerializeMessage for ConversationMessage {
+//     fn serialize_message(&self, buf: &mut Buf) {
+//         use conversation_message::*;
+//         let ConversationMessage { text, r#type, images, tool_results, thinking, .. } = self;
+
+//         buf.field_opt(
+//             r#type.try_get().ok().and_then(|ty| (ty != MessageType::Unspecified).then_some(ty)),
+//             |b, v| {
+//                 b.put_tag(match v {
+//                     MessageType::Human => b'H',
+//                     MessageType::Ai => b'A',
+//                     MessageType::Unspecified => unreachable!(),
+//                 });
+//             },
+//         )
+//         .field_if(!text.is_empty(), |b| {
+//             b.put_str(text);
+//         })
+//         // field_iter 已加 ITEM_SEP，不需要内部 item()
+//         .field_iter_if(!images.is_empty(), images.iter(), |b, v| {
+//             b.put(v.data.as_ref());
+//         })
+//         // 内部结构复杂，手动 item 避免语义冲突
+//         .field_if(!tool_results.is_empty(), |b| {
+//             for v in tool_results {
+//                 b.item(|b| {
+//                     b.field(|b| {
+//                         b.put_str(v.tool_call_id.as_ref());
+//                     })
+//                     .field(|b| {
+//                         b.put_str(v.tool_name.as_ref());
+//                     })
+//                     .field_opt(v.model_call_id.as_ref(), |b, v| {
+//                         b.put_str(v.as_ref());
+//                     })
+//                     .field(|b| {
+//                         b.put_str(v.raw_args.as_ref());
+//                     })
+//                     .field_opt(
+//                         v.result.as_ref().and_then(|v| v.result.as_ref()),
+//                         |b, v| {
+//                             b.put_str(v.as_ref());
+//                         },
+//                     );
+//                 });
+//             }
+//         })
+//         // 外层 field_opt 封口最后一个子字段
+//         .field_opt(thinking.as_ref(), |b, v| {
+//             b.field(|b| {
+//                 b.put_str(&v.text);
+//             })
+//             .field(|b| {
+//                 b.put_str(&v.signature);
+//             })
+//             .put_str(&v.redacted_thinking);
+//         });
+//     }
+// }

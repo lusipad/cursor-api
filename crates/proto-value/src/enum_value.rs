@@ -9,6 +9,11 @@ impl<T> Enum<T> {
     pub const fn new(value: i32) -> Self { Self(value, PhantomData) }
     #[inline(always)]
     pub const fn get(self) -> i32 { self.0 }
+    #[inline(always)]
+    pub const fn try_get(self) -> Result<T, <T as TryFrom<i32>>::Error>
+    where T: [const] TryFrom<i32> {
+        T::try_from(self.0)
+    }
 }
 
 impl<T> Clone for Enum<T> {
@@ -50,7 +55,7 @@ mod serde_impls {
         #[inline]
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where S: Serializer {
-            match T::try_from(self.get()) {
+            match self.try_get() {
                 Ok(v) => v.serialize(serializer),
                 Err(_) => serializer.serialize_i32(self.get()),
             }

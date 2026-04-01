@@ -4,7 +4,7 @@ pub mod manager;
 mod storage;
 
 use crate::{app::model::ExtTokenHelper, core::constant::get_static_id};
-pub use command::{GetLogsParams, LogUpdate};
+pub use command::{LogPatch, LogQuery};
 use interned::Str;
 pub use manager::{LogManager, create_task};
 
@@ -165,26 +165,26 @@ impl From<&super::RequestLog> for RequestLogHelper {
 //     }
 // }
 #[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize)]
-pub(super) struct AssociatedTokenHelper {
+pub(super) struct TokenEntryHelper {
     token: ExtTokenHelper,
     ref_count: usize,
 }
-impl From<AssociatedTokenHelper> for storage::AssociatedToken {
+impl From<TokenEntryHelper> for storage::TokenEntry {
     #[inline]
-    fn from(a: AssociatedTokenHelper) -> storage::AssociatedToken {
-        storage::AssociatedToken { token: a.token.extract(), ref_count: a.ref_count }
+    fn from(a: TokenEntryHelper) -> storage::TokenEntry {
+        storage::TokenEntry { token: a.token.extract(), ref_count: a.ref_count }
     }
 }
-impl From<&storage::AssociatedToken> for AssociatedTokenHelper {
+impl From<&storage::TokenEntry> for TokenEntryHelper {
     #[inline]
-    fn from(a: &storage::AssociatedToken) -> Self {
+    fn from(a: &storage::TokenEntry) -> Self {
         Self { token: ExtTokenHelper::new(&a.token), ref_count: a.ref_count }
     }
 }
 #[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize)]
 pub(super) struct LogManagerHelper {
     logs: Vec<RequestLogHelper>,
-    tokens: HashMap<super::TokenKey, AssociatedTokenHelper>,
+    tokens: HashMap<super::TokenKey, TokenEntryHelper>,
 }
 impl From<LogManagerHelper> for manager::LogManager {
     #[inline]

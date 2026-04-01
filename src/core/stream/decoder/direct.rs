@@ -52,7 +52,7 @@ impl UnaryDecoder {
 
         match self.content_type {
             UnaryContentType::Json => {
-                let cursor_err = serde_json::from_slice::<CursorError>(payload.as_ref())
+                let cursor_err = sonic_rs::from_slice::<CursorError>(payload.as_ref())
                     .map_err(|source| DecoderError::CursorErrorJsonDecodeFailed { source })?;
                 Ok(Err(cursor_err))
             }

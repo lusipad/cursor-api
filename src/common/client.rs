@@ -1,25 +1,30 @@
 use super::model::HeaderValue;
-use crate::app::{
-    constant::{
-        CURSOR_API2_HOST, CURSOR_HOST,
-        header::{
-            AMZN_TRACE_ID, CLIENT_KEY, CLOSE, CONNECT_ACCEPT_ENCODING, CONNECT_CONTENT_ENCODING,
-            CONNECT_ES, CONNECT_PROTO, CONNECT_PROTOCOL_VERSION, CONNECTION, CORS, CROSS_SITE,
-            CURSOR_CHECKSUM, CURSOR_CLIENT_VERSION, CURSOR_CONFIG_VERSION, CURSOR_ORIGIN,
-            CURSOR_REFERER_URL, CURSOR_STREAMING, CURSOR_TIMEZONE, EMPTY, ENCODING, ENCODINGS,
-            FALSE, FS_CLIENT_KEY, GHOST_MODE, HEADER_VALUE_ACCEPT, HOST, JSON, KEEP_ALIVE,
-            LANGUAGE, MOBILE_NO, NEW_ONBOARDING_COMPLETED, NO_CACHE, NONE, NOT_A_BRAND, ONE,
-            PRIORITY, PROTO, PROXY_HOST, REQUEST_ID, SAME_ORIGIN, SEC_CH_UA, SEC_CH_UA_MOBILE,
-            SEC_CH_UA_PLATFORM, SEC_FETCH_DEST, SEC_FETCH_MODE, SEC_FETCH_SITE, SEC_GPC,
-            SESSION_ID, TRAILERS, TRUE, U_EQ_0, U_EQ_1_I, VSCODE_ORIGIN, ZERO,
+use crate::{
+    app::{
+        constant::{
+            CURSOR_API2_HOST, CURSOR_HOST,
+            header::{
+                AMZN_TRACE_ID, CLIENT_KEY, CLOSE, CONNECT_ACCEPT_ENCODING,
+                CONNECT_CONTENT_ENCODING, CONNECT_ES, CONNECT_PROTO, CONNECT_PROTOCOL_VERSION,
+                CONNECTION, CORS, CROSS_SITE, CURSOR_CHECKSUM, CURSOR_CLIENT_ARCH,
+                CURSOR_CLIENT_DEVICE_TYPE, CURSOR_CLIENT_OS, CURSOR_CLIENT_TYPE,
+                CURSOR_CLIENT_VERSION, CURSOR_CONFIG_VERSION, CURSOR_ORIGIN, CURSOR_REFERER_URL,
+                CURSOR_STREAMING, CURSOR_TIMEZONE, DESKTOP, EMPTY, ENCODING, ENCODINGS, FALSE,
+                FS_CLIENT_KEY, GHOST_MODE, HEADER_VALUE_ACCEPT, HOST, IDE, JSON, KEEP_ALIVE,
+                LANGUAGE, MOBILE_NO, NEW_ONBOARDING_COMPLETED, NO_CACHE, NONE, NOT_A_BRAND, ONE,
+                PRIORITY, PROTO, PROXY_HOST, REQUEST_ID, SAME_ORIGIN, SEC_CH_UA, SEC_CH_UA_MOBILE,
+                SEC_CH_UA_PLATFORM, SEC_FETCH_DEST, SEC_FETCH_MODE, SEC_FETCH_SITE, SEC_GPC,
+                SESSION_ID, TRAILERS, TRUE, U_EQ_0, U_EQ_1_I, VSCODE_ORIGIN, ZERO,
+            },
         },
+        lazy::{
+            USE_PRI_REVERSE_PROXY, USE_PUB_REVERSE_PROXY, pri_reverse_proxy_host,
+            pub_reverse_proxy_host, sessions_url, stripe_url, token_refresh_url, token_upgrade_url,
+            usage_api_url,
+        },
+        model::{ExtToken, cursor_version, platform},
     },
-    lazy::{
-        USE_PRI_REVERSE_PROXY, USE_PUB_REVERSE_PROXY, pri_reverse_proxy_host,
-        pub_reverse_proxy_host, sessions_url, stripe_url, token_refresh_url, token_upgrade_url,
-        usage_api_url,
-    },
-    model::{ExtToken, cursor_version, platform},
+    core::stream::session::UpstreamTx,
 };
 use http::{
     header::{
@@ -28,7 +33,9 @@ use http::{
     },
     method::Method,
 };
-use reqwest::{Client, RequestBuilder};
+use reqwest::{Client, RequestBuilder, Response};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use url::Url;
 
 trait RequestBuilderExt: Sized {
@@ -131,7 +138,9 @@ fn get_client(
     use_pri: bool,
     real_host: &'static str,
 ) -> RequestBuilder {
-    if (use_pri && unsafe { USE_PRI_REVERSE_PROXY }) || (!use_pri && unsafe { USE_PUB_REVERSE_PROXY }) {
+    if (use_pri && unsafe { USE_PRI_REVERSE_PROXY })
+        || (!use_pri && unsafe { USE_PUB_REVERSE_PROXY })
+    {
         client
             .request(method, url)
             .header(PROXY_HOST, unsafe { super::model::HeaderValue::from_static(real_host).into() })
@@ -148,14 +157,13 @@ fn get_client_and_host(
     use_pri: bool,
     real_host: &'static str,
 ) -> (RequestBuilder, http::header::HeaderValue) {
+    let real_host = unsafe { super::model::HeaderValue::from_static(real_host).into() };
     if use_pri && unsafe { USE_PRI_REVERSE_PROXY } {
         (client.request(method, url).header(PROXY_HOST, real_host), pri_reverse_proxy_host())
     } else if !use_pri && unsafe { USE_PUB_REVERSE_PROXY } {
         (client.request(method, url).header(PROXY_HOST, real_host), pub_reverse_proxy_host())
     } else {
-        (client.request(method, url), unsafe {
-            super::model::HeaderValue::from_static(real_host).into()
-        })
+        (client.request(method, url), real_host)
     }
 }
 
@@ -169,6 +177,8 @@ pub(crate) struct AiServiceRequest<'a> {
     pub use_pri: bool,
     pub cookie: Option<http::HeaderValue>,
     pub exact_length: Option<usize>,
+    pub platform: Option<byte_str::ByteStr>,
+    pub arch: Option<byte_str::ByteStr>,
 }
 
 pub fn build_client_request(req: AiServiceRequest) -> RequestBuilder {
@@ -218,6 +228,15 @@ pub fn build_client_request(req: AiServiceRequest) -> RequestBuilder {
             req.ext_token.checksum.to_str(&mut buf);
             HeaderValue::from_bytes(&buf).into()
         })
+        .opt_header_map(CURSOR_CLIENT_ARCH, req.arch, |v| unsafe {
+            HeaderValue::new(v.into_bytes()).into()
+        })
+        .header(CURSOR_CLIENT_DEVICE_TYPE, DESKTOP)
+        .opt_header_map(CURSOR_CLIENT_OS, req.platform, |v| unsafe {
+            HeaderValue::new(v.into_bytes()).into()
+        })
+        // skip x-cursor-client-os-version
+        .header(CURSOR_CLIENT_TYPE, IDE)
         .header(CURSOR_CLIENT_VERSION, cursor_version::client_version())
         .opt_header_map(CURSOR_CONFIG_VERSION, req.ext_token.config_version, |v| {
             v.hyphenated().encode_lower(unsafe { &mut *(buf.as_mut_ptr() as *mut [u8; 36]) });
@@ -513,4 +532,17 @@ pub fn build_sessions_request(
         .header(CACHE_CONTROL, NO_CACHE)
         .header(TE, TRAILERS)
         .header(PRIORITY, U_EQ_0)
+}
+
+pub async fn open_bidi_stream(
+    req: RequestBuilder,
+    first_frame: bytes::Bytes,
+) -> Result<(UpstreamTx, Response), reqwest::Error> {
+    let (tx, rx) = mpsc::channel(4);
+    // first_frame 已编码好（encode_message_framed 的输出）
+    // channel 有 4 buffer，同步发不会阻塞
+    tx.try_send(Ok(first_frame)).expect("channel just created");
+    let body = reqwest::Body::wrap_stream(ReceiverStream::new(rx));
+    let response = req.body(body).send().await?;
+    Ok((tx, response))
 }

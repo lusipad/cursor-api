@@ -939,13 +939,109 @@ pub mod bytes {
 pub mod message {
     use super::*;
 
-    pub fn encode<M>(number: NonZeroU32, msg: &M, buf: &mut impl BufMut)
+    /// Maximum varint bytes for a length delimiter.
+    /// 64-bit: usize ≤ isize::MAX (63 bits) → 9 varint bytes.
+    /// 32-bit: usize ≤ isize::MAX (31 bits) → 5 varint bytes.
+    #[cfg(target_pointer_width = "64")]
+    const LEN_MAX: usize = 9;
+    #[cfg(target_pointer_width = "32")]
+    const LEN_MAX: usize = 5;
+
+    /// Write a length varint directly to a raw pointer.
+    /// Returns bytes written (1..=LEN_MAX).
+    ///
+    /// # Safety
+    /// `ptr` must have at least `LEN_MAX` writable bytes.
+    #[inline(always)]
+    unsafe fn write_len_varint(mut value: usize, ptr: *mut u8) -> usize {
+        let mut i = 0;
+        while value >= 0x80 {
+            *ptr.add(i) = (value as u8 & 0x7F) | 0x80;
+            value >>= 7;
+            i += 1;
+        }
+        *ptr.add(i) = value as u8;
+        i + 1
+    }
+
+    /// Single-pass message encoding via length-prefix backfill.
+    ///
+    /// Instead of calling `encoded_len()` before `encode_raw()`, this:
+    /// 1. Writes the field tag
+    /// 2. Reserves `LEN_MAX` bytes as a varint placeholder
+    /// 3. Calls `encode_raw()` — which cascades backfill into nested messages
+    /// 4. Measures the actual body length from buffer growth
+    /// 5. Writes the real varint, `memmove`s to close the gap
+    ///
+    /// **Complexity reduction:** from O(D×N) to O(N) field visits
+    /// (D = max nesting depth, N = total fields).
+    ///
+    /// The `memmove` cost per nesting level is bounded by `LEN_MAX - 1` bytes
+    /// of shift over the body at that level — negligible versus the eliminated
+    /// recursive `encoded_len` traversal.
+    #[inline(always)]
+    fn encode_backfill<M: Message>(
+        number: NonZeroU32,
+        msg: &M,
+        buf: &mut impl varint::ReservableBuf,
+    ) {
+        use varint::ReservableBuf as RB;
+
+        encode_tag(number, WireType::LengthDelimited, buf);
+
+        let old_len = RB::len(buf);
+
+        // Reserve placeholder for length varint
+        RB::reserve(buf, LEN_MAX);
+        unsafe { RB::set_len(buf, old_len + LEN_MAX) };
+
+        // Encode body after placeholder.
+        // Concrete type (Vec<u8>/BytesMut) cascades through monomorphization,
+        // so nested `message::encode` calls also enter the backfill path.
+        msg.encode_raw(buf);
+
+        // Measure body and backfill the varint
+        let total = RB::len(buf);
+        let body_len = total - old_len - LEN_MAX;
+
+        unsafe {
+            // Pointer must be read AFTER encode_raw (buffer may have reallocated)
+            let base = RB::as_mut_ptr(buf).add(old_len);
+            let varint_len = write_len_varint(body_len, base);
+            let gap = LEN_MAX - varint_len;
+
+            if gap > 0 {
+                ::core::ptr::copy(
+                    base.add(LEN_MAX),    // src: current body start
+                    base.add(varint_len), // dst: right after actual varint
+                    body_len,
+                );
+                RB::set_len(buf, total - gap);
+            }
+        }
+    }
+
+    pub fn encode<M, B>(number: NonZeroU32, msg: &M, buf: &mut B)
     where
         M: Message,
+        B: BufMut,
     {
-        encode_tag(number, WireType::LengthDelimited, buf);
-        encode_varint(msg.encoded_len(), buf);
-        msg.encode_raw(buf);
+        let _id = type_id_of::<B>();
+
+        if let Some(buf) = unsafe {
+            downcast_mut_prechecked::<Vec<u8>, B>(buf, _id == __alloc__vec__Vec_u8_)
+        } {
+            encode_backfill(number, msg, buf);
+        } else if let Some(buf) = unsafe {
+            downcast_mut_prechecked::<::bytes::BytesMut, B>(buf, _id == __bytes__BytesMut)
+        } {
+            encode_backfill(number, msg, buf);
+        } else {
+            // Fallback: two-pass for opaque BufMut implementations
+            encode_tag(number, WireType::LengthDelimited, buf);
+            encode_varint(msg.encoded_len(), buf);
+            msg.encode_raw(buf);
+        }
     }
 
     pub fn merge<M, B>(

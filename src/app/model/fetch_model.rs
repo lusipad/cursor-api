@@ -54,9 +54,7 @@ impl ::serde::Serialize for FetchMode {
     /// 序列化获取模式
     #[inline]
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: ::serde::Serializer,
-    {
+    where S: ::serde::Serializer {
         serializer.serialize_str(self.as_str())
     }
 }
@@ -65,9 +63,7 @@ impl<'de> ::serde::Deserialize<'de> for FetchMode {
     /// 反序列化获取模式
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: ::serde::Deserializer<'de>,
-    {
+    where D: ::serde::Deserializer<'de> {
         let s = String::deserialize(deserializer)?;
         Ok(Self::from_str(s))
     }

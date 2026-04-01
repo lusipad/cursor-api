@@ -15,6 +15,9 @@ use std::{
 };
 use zip::ZipArchive;
 
+#[cfg(not(feature = "__perf"))]
+use serde_json as sonic_rs;
+
 type HashMap<K, V> = hashbrown::HashMap<K, V, ahash::RandomState>;
 type HashSet<K> = hashbrown::HashSet<K, ahash::RandomState>;
 
@@ -143,7 +146,7 @@ pub enum FrontendError {
     NotZipOrDirectory(Cow<'static, Path>),
     RegistryNotFound { searched_at: String },
     FileMissing { path: String, referenced_by: Vec<String> },
-    InvalidJson { context: String, source: serde_json::Error },
+    InvalidJson { context: String, source: sonic_rs::Error },
     InvalidHeader { route: String, name: String, value: String, reason: String },
     InvalidStatus { route: String, status: u16 },
     NoExtension { route: String, path: String },
@@ -301,7 +304,7 @@ impl FrontendLoader {
         })?;
 
         let registry: RouteRegistry =
-            serde_json::from_str(&json).map_err(|e| FrontendError::InvalidJson {
+            sonic_rs::from_str(&json).map_err(|e| FrontendError::InvalidJson {
                 context: format!("route_registry.json at {}", registry_path.display()),
                 source: e,
             })?;
@@ -329,7 +332,7 @@ impl FrontendLoader {
             let mut json = String::new();
             registry_file.read_to_string(&mut json)?;
 
-            serde_json::from_str(&json).map_err(|e| FrontendError::InvalidJson {
+            sonic_rs::from_str(&json).map_err(|e| FrontendError::InvalidJson {
                 context: format!("route_registry.json in {}", zip_path.display()),
                 source: e,
             })?
@@ -546,7 +549,7 @@ pub const fn metadata() -> Option<&'static str> { unsafe { METADATA } }
 fn print_metadata(registry: &RouteRegistry) {
     unsafe {
         METADATA =
-            Some(Box::leak(serde_json::to_string(registry).unwrap_unchecked().into_boxed_str()))
+            Some(Box::leak(sonic_rs::to_string(registry).unwrap_unchecked().into_boxed_str()))
     };
 
     // println!(

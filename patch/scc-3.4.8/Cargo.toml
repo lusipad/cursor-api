@@ -2,7 +2,7 @@
 name = "scc"
 description = "A collection of high-performance asynchronous/concurrent containers with both asynchronous and synchronous interfaces"
 documentation = "https://docs.rs/scc"
-version = "3.6.5"
+version = "3.6.10"
 authors = ["wvwwvwwv <wvwwvwwv@me.com>"]
 edition = "2024"
 rust-version = "1.85.0"
@@ -16,7 +16,7 @@ keywords = ["async", "cache", "concurrent", "hashmap", "tree"]
 equivalent = { version = "1.0", optional = true }
 loom = { version = "0.7", optional = true, features = ["checkpoint"] }
 saa = "5.5"
-sdd = "4.6"
+sdd = "4.7"
 serde = { version = "1.0", optional = true }
 
 [features]
@@ -29,7 +29,7 @@ futures = "0.3"
 proptest = "1.10"
 serde_test = "1.0"
 static_assertions = "1.1"
-tokio = { version = "1.49", features = ["full"] }
+tokio = { version = "1.50", features = ["full"] }
 
 [[bench]]
 name = "hash_map"

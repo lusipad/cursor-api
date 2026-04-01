@@ -4,60 +4,65 @@ use core::{
     task::{Context, Poll},
 };
 use futures_core::stream::Stream;
+use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-/// 可通过外部信号控制 drop 的 Stream 包装器
+/// 可通过外部信号控制的 Stream 包装器
+/// 停止时将内部流存入 stash 而非 drop，支持取回复用
 pub struct DroppableStream<S> {
     stream: Option<S>,
+    stash: Arc<Mutex<Option<S>>>,
     notify: Arc<Notify>,
     dropped: bool,
 }
 
-/// 用于触发 Stream drop 的控制句柄
-#[derive(Clone)]
-#[repr(transparent)]
-pub struct DropHandle {
+/// 控制句柄
+pub struct DropHandle<S> {
     notify: Arc<Notify>,
+    stash: Arc<Mutex<Option<S>>>,
 }
 
-impl<S> DroppableStream<S>
-where S: Stream + Unpin
-{
-    /// 创建新的可控制 Stream 和其控制句柄
-    pub fn new(stream: S) -> (Self, DropHandle) {
-        let notify = Arc::new(Notify::new());
+// S 不需要 Clone，Arc 内部共享
+impl<S> Clone for DropHandle<S> {
+    fn clone(&self) -> Self { Self { notify: self.notify.clone(), stash: self.stash.clone() } }
+}
 
+impl<S: Stream + Unpin> DroppableStream<S> {
+    pub fn new(stream: S) -> (Self, DropHandle<S>) {
+        let notify = Arc::new(Notify::new());
+        let stash = Arc::new(Mutex::new(None));
         (
-            Self { stream: Some(stream), notify: notify.clone(), dropped: false },
-            DropHandle { notify },
+            Self {
+                stream: Some(stream),
+                stash: stash.clone(),
+                notify: notify.clone(),
+                dropped: false,
+            },
+            DropHandle { notify, stash },
         )
     }
 }
 
-impl<S> Stream for DroppableStream<S>
-where S: Stream + Unpin
-{
+impl<S: Stream + Unpin> Stream for DroppableStream<S> {
     type Item = S::Item;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        // 如果已经处理过 drop，直接返回
         if this.dropped {
             return Poll::Ready(None);
         }
 
-        // 检查是否有 drop 通知
         let notified = this.notify.notified();
         futures_util::pin_mut!(notified);
 
         if notified.poll(cx).is_ready() {
-            this.stream = None;
+            // 存入 stash 而非 drop，支持后续 take_stream 取回
+            *this.stash.lock() = this.stream.take();
             this.dropped = true;
             return Poll::Ready(None);
         }
 
-        // 轮询内部 stream
         if let Some(ref mut stream) = this.stream {
             Pin::new(stream).poll_next(cx)
         } else {
@@ -66,7 +71,14 @@ where S: Stream + Unpin
     }
 }
 
-impl DropHandle {
-    /// 触发关联 Stream 的 drop
-    pub fn drop_stream(self) { self.notify.notify_one(); }
+impl<S> DropHandle<S> {
+    /// 触发停止（流结束 / 正常关闭）
+    pub fn drop_stream(self) { self.notify.notify_one() }
+
+    /// 触发停止并取回内部流（用于 park）
+    /// 必须在 DroppableStream 返回 None 之后调用（如 .chain() 中）
+    pub fn take_stream(self) -> Option<S> {
+        self.notify.notify_one();
+        self.stash.lock().take()
+    }
 }

@@ -3,22 +3,68 @@ mod provider;
 
 use crate::{
     app::constant::HEADER_B64,
-    common::{
-        model::token::TokenPayload,
-        utils::{hex::HEX_CHARS, hex_to_byte, ulid},
-    },
+    common::{model::token::TokenPayload, utils::ulid},
 };
 use base64_simd::{Out, URL_SAFE_NO_PAD};
 pub(super) use cache::__init;
 pub use cache::{Token, TokenKey};
 use core::{fmt, mem::MaybeUninit};
+use hex_simd::{AsciiCase, decode, encode};
 use proto_value::stringify::Stringify;
 pub use provider::{Provider, parse_providers};
 use std::{io, str::FromStr};
 
 mod randomness {
-    /// 字节在格式化字符串中的起始位置（格式：XXXXXXXX-XXXX-XXXX）
-    pub(super) static BYTE_OFFSETS: [usize; 8] = [0, 2, 4, 6, 9, 11, 14, 16];
+    //! Randomness 的格式化布局：`XXXXXXXX-XXXX-XXXX` (18 字节)
+    //!
+    //! 紧凑 hex (16 字节) 与格式化字符串之间的映射：
+    //!
+    //! ```text
+    //! compact:   H0 H1 H2 H3 H4 H5 H6 H7 H8 H9 HA HB HC HD HE HF
+    //! formatted: H0 H1 H2 H3 H4 H5 H6 H7 -  H8 H9 HA HB -  HC HD HE HF
+    //!            ├── 保持不动 (0..8) ──┤    ├─ 右移1 ──┤    ├─ 右移2 ──┤
+    //! ```
+
+    pub(super) const FORMATTED_LEN: usize = 18;
+    pub(super) const COMPACT_LEN: usize = 16;
+    pub(super) const SEP1: usize = 8;
+    pub(super) const SEP2: usize = 13;
+
+    /// 将 encode 产出的 16 字节紧凑 hex 就地展开为 18 字节格式化串。
+    ///
+    /// # Safety
+    /// `buf` 必须至少 18 字节，且前 16 字节已被 hex encode 填充。
+    ///
+    /// 搬移顺序：先远后近，避免重叠踩踏。
+    /// - `copy(12→14, 4)`: `HC HD HE HF` 右移 2，src 12..16 与 dst 14..18 重叠 2 字节，memmove 安全。
+    /// - `copy(8→9, 4)`:   `H8 H9 HA HB` 右移 1，src 8..12 与 dst 9..13 重叠 3 字节，memmove 安全。
+    #[inline]
+    pub(super) unsafe fn expand(buf: &mut [u8; FORMATTED_LEN]) {
+        let ptr = buf.as_mut_ptr();
+        unsafe {
+            core::ptr::copy(ptr.add(12).cast_const(), ptr.add(14), 4);
+            core::ptr::copy(ptr.add(8).cast_const(), ptr.add(9), 4);
+        }
+        buf[SEP1] = b'-';
+        buf[SEP2] = b'-';
+    }
+
+    /// 将 18 字节格式化串就地压缩为前 16 字节紧凑 hex。
+    ///
+    /// # Safety
+    /// `bytes` 必须是合法的格式化 Randomness 串（分隔符位置已校验）。
+    ///
+    /// 搬移顺序：先近后远，避免重叠踩踏。
+    /// - `copy(9→8, 4)`:   `H8 H9 HA HB` 左移 1，src 9..13 与 dst 8..12 重叠 3 字节，memmove 安全。
+    /// - `copy(14→12, 4)`: `HC HD HE HF` 左移 2，src 14..18 与 dst 12..16 重叠 2 字节，memmove 安全。
+    #[inline]
+    pub(super) unsafe fn compact(bytes: &mut [u8; FORMATTED_LEN]) {
+        let ptr = bytes.as_mut_ptr();
+        unsafe {
+            core::ptr::copy(ptr.add(9).cast_const(), ptr.add(8), 4);
+            core::ptr::copy(ptr.add(14).cast_const(), ptr.add(12), 4);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -63,17 +109,10 @@ impl Randomness {
     #[inline]
     pub fn to_str<'buf>(&self, buf: &'buf mut [u8; 18]) -> &'buf mut str {
         let bytes: [u8; 8] = self.0.to_ne_bytes();
-
-        for (&byte, pos) in bytes.iter().zip(randomness::BYTE_OFFSETS) {
-            buf[pos] = HEX_CHARS[(byte >> 4) as usize];
-            buf[pos + 1] = HEX_CHARS[(byte & 0x0F) as usize];
-        }
-
-        // 插入分隔符
-        buf[8] = b'-';
-        buf[13] = b'-';
-
-        // SAFETY: buf 只包含有效的 ASCII 字符
+        let _ = encode(&bytes, Out::from_slice(buf), AsciiCase::Lower);
+        // SAFETY: encode 已填充 buf[0..16]
+        unsafe { randomness::expand(buf) };
+        // SAFETY: buf 只含 ASCII hex 字符和 '-'
         unsafe { core::str::from_utf8_unchecked_mut(buf) }
     }
 }
@@ -107,18 +146,16 @@ impl FromStr for Randomness {
             return Err(RandomnessError::InvalidLength);
         }
         let bytes = s.as_bytes();
-
-        if bytes[8] != b'-' || bytes[13] != b'-' {
+        if bytes[randomness::SEP1] != b'-' || bytes[randomness::SEP2] != b'-' {
             return Err(RandomnessError::InvalidFormat);
         }
+        let mut bytes: [u8; 18] = bytes.try_into().unwrap();
+        // SAFETY: 分隔符位置已校验
+        unsafe { randomness::compact(&mut bytes) };
 
         let mut result = [0u8; 8];
-
-        for (result_byte, pos) in result.iter_mut().zip(randomness::BYTE_OFFSETS) {
-            *result_byte =
-                hex_to_byte(bytes[pos], bytes[pos + 1]).ok_or(RandomnessError::InvalidFormat)?;
-        }
-
+        decode(&bytes[..randomness::COMPACT_LEN], Out::from_slice(&mut result))
+            .map_err(|_| RandomnessError::InvalidFormat)?;
         Ok(Self(u64::from_ne_bytes(result)))
     }
 }
@@ -302,10 +339,7 @@ impl UserId {
     pub fn to_str<'buf>(&self, buf: &'buf mut [u8; 31]) -> &'buf mut str {
         if self.is_legacy() {
             // 旧格式：24字符 hex，从 bytes[4..16] 编码
-            for (i, &byte) in self.0[4..].iter().enumerate() {
-                buf[i * 2] = HEX_CHARS[(byte >> 4) as usize];
-                buf[i * 2 + 1] = HEX_CHARS[(byte & 0x0f) as usize];
-            }
+            let _ = encode(&self.0[4..], Out::from_slice(buf), AsciiCase::Lower);
 
             // SAFETY: HEX_CHARS 确保输出是有效 ASCII
             unsafe { core::str::from_utf8_unchecked_mut(&mut buf[..24]) }
@@ -346,13 +380,10 @@ impl core::str::FromStr for UserId {
                 Ok(Self::from_u128(id))
             }
             24 => {
-                let hex_array: &[u8; 24] = unsafe { s.as_bytes().as_array().unwrap_unchecked() };
-                let hex_pairs = unsafe { hex_array.as_chunks_unchecked::<2>() };
                 let mut result = [0u8; 16];
 
-                for (dst, &[hi, lo]) in result[4..].iter_mut().zip(hex_pairs) {
-                    *dst = hex_to_byte(hi, lo).ok_or(SubjectError::InvalidHex)?;
-                }
+                decode(s.as_bytes(), Out::from_slice(&mut result))
+                    .map_err(|_| SubjectError::InvalidHex)?;
 
                 Ok(Self::from_bytes(result))
             }
@@ -663,9 +694,8 @@ impl fmt::Display for RawToken {
             f,
             "{HEADER_B64}{}.{}",
             URL_SAFE_NO_PAD
-                .encode_to_string(__unwrap!(serde_json::to_vec(&self.into_token_payload()))),
-            URL_SAFE_NO_PAD
-                .encode_as_str(&self.signature, base64_simd::Out::from_slice(&mut [0; 43]))
+                .encode_to_string(__unwrap!(sonic_rs::to_vec(&self.into_token_payload()))),
+            URL_SAFE_NO_PAD.encode_as_str(&self.signature, Out::from_slice(&mut [0; 43]))
         )
     }
 }
@@ -694,7 +724,7 @@ impl FromStr for RawToken {
             .map_err(|_| TokenError::InvalidBase64)?;
 
         // 3. 解析payload
-        let payload: TokenPayload = serde_json::from_slice(&payload).map_err(|e| {
+        let payload: TokenPayload = sonic_rs::from_slice(&payload).map_err(|e| {
             let e: io::Error = e.into();
             match e.downcast::<SubjectError>() {
                 Ok(e) => TokenError::InvalidSubject(e),

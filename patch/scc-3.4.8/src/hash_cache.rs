@@ -8,16 +8,17 @@ use std::mem::replace;
 use std::ops::{Deref, DerefMut, RangeInclusive};
 #[cfg(not(feature = "loom"))]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::{Acquire, Relaxed};
 
 #[cfg(feature = "loom")]
 use loom::sync::atomic::AtomicUsize;
-use sdd::{AtomicShared, Shared, Tag};
+use sdd::{AtomicRaw, Owned};
 
 use super::hash_table::MAXIMUM_CAPACITY_LIMIT;
 use super::hash_table::bucket::{CACHE, DoublyLinkedList, EntryPtr};
 use super::hash_table::bucket_array::BucketArray;
 use super::hash_table::{HashTable, LockedBucket};
+use super::utils::{fake_ref, get_owned};
 use super::{Equivalent, Guard};
 
 /// Scalable asynchronous/concurrent 32-way associative cache backed by [`HashMap`](super::HashMap).
@@ -41,7 +42,7 @@ pub struct HashCache<K, V, H = RandomState>
 where
     H: BuildHasher,
 {
-    bucket_array: AtomicShared<BucketArray<K, V, DoublyLinkedList, CACHE>>,
+    bucket_array: AtomicRaw<BucketArray<K, V, DoublyLinkedList, CACHE>>,
     minimum_capacity: AtomicUsize,
     maximum_capacity: usize,
     build_hasher: H,
@@ -130,7 +131,7 @@ where
     #[inline]
     pub const fn with_hasher(build_hasher: H) -> Self {
         HashCache {
-            bucket_array: AtomicShared::null(),
+            bucket_array: AtomicRaw::null(),
             minimum_capacity: AtomicUsize::new(0),
             maximum_capacity: DEFAULT_MAXIMUM_CAPACITY,
             build_hasher,
@@ -142,7 +143,7 @@ where
     #[inline]
     pub fn with_hasher(build_hasher: H) -> Self {
         Self {
-            bucket_array: AtomicShared::null(),
+            bucket_array: AtomicRaw::null(),
             minimum_capacity: AtomicUsize::new(0),
             maximum_capacity: DEFAULT_MAXIMUM_CAPACITY,
             build_hasher,
@@ -173,19 +174,19 @@ where
         build_hasher: H,
     ) -> Self {
         let (array, minimum_capacity) = if minimum_capacity == 0 {
-            (AtomicShared::null(), AtomicUsize::new(0))
+            (AtomicRaw::null(), AtomicUsize::new(0))
         } else {
-            let array = unsafe {
-                Shared::new_with_unchecked(|| {
+            let bucket_array = unsafe {
+                Owned::new_with_unchecked(|| {
                     BucketArray::<K, V, DoublyLinkedList, CACHE>::new(
                         minimum_capacity,
-                        AtomicShared::null(),
+                        AtomicRaw::null(),
                     )
                 })
             };
-            let minimum_capacity = array.num_slots();
+            let minimum_capacity = bucket_array.num_slots();
             (
-                AtomicShared::from(array),
+                AtomicRaw::new(bucket_array.into_raw()),
                 AtomicUsize::new(minimum_capacity),
             )
         };
@@ -1255,14 +1256,13 @@ where
 {
     #[inline]
     fn drop(&mut self) {
-        self.bucket_array
-            .swap((None, Tag::None), Relaxed)
-            .0
-            .map(|a| unsafe {
+        if let Some(bucket_array) = get_owned(self.bucket_array.load(Acquire, fake_ref(self))) {
+            unsafe {
                 // The entire array does not need to wait for an epoch change as no references will
                 // remain outside the lifetime of the `HashCache`.
-                a.drop_in_place()
-            });
+                bucket_array.drop_in_place();
+            }
+        }
         for _ in 0..4 {
             Guard::new().accelerate();
         }
@@ -1301,7 +1301,7 @@ where
     }
 
     #[inline]
-    fn bucket_array_var(&self) -> &AtomicShared<BucketArray<K, V, DoublyLinkedList, CACHE>> {
+    fn bucket_array_var(&self) -> &AtomicRaw<BucketArray<K, V, DoublyLinkedList, CACHE>> {
         &self.bucket_array
     }
 

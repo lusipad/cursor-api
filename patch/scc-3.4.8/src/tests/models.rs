@@ -204,7 +204,7 @@ fn hashindex_key_visibility() {
 fn tree_index_split_leaf_node() {
     let _guard = SERIALIZER.lock().unwrap();
 
-    let keys = 14;
+    let keys = 15;
     let key_to_remove = 0;
     let mut model_builder_leaf_node = Builder::new();
     model_builder_leaf_node.max_branches = 1_048_576;
@@ -253,7 +253,7 @@ fn tree_index_split_leaf_node() {
 fn tree_index_split_internal_node() {
     let _guard = SERIALIZER.lock().unwrap();
 
-    let keys = 365; // `13 * 14 + 14` + 1 will trigger an internal creation.
+    let keys = 225; // Root split starts at this key.
     let key_to_remove = 0;
     let mut model_builder_new_internal_node = Builder::new();
     model_builder_new_internal_node.max_branches = 1_048_576 * 16;
@@ -303,8 +303,8 @@ fn tree_index_split_internal_node() {
 fn tree_index_remove_leaf_node() {
     let _guard = SERIALIZER.lock().unwrap();
 
-    let keys = 15;
-    let key_to_remove = 14;
+    let keys = 16;
+    let key_to_remove = 15;
     let mut model_builder_remove_leaf = Builder::new();
     model_builder_remove_leaf.max_branches = 1_048_576 * 16;
     model_builder_remove_leaf.check(move || {
@@ -352,8 +352,8 @@ fn tree_index_remove_leaf_node() {
 fn tree_index_remove_internal_node() {
     let _guard = SERIALIZER.lock().unwrap();
 
-    let keys = 366;
-    let key_to_remove = 338;
+    let keys = 226;
+    let key_to_remove = 225;
     let mut model_builder_remove_node = Builder::new();
     model_builder_remove_node.max_branches = 1_048_576 * 16;
     model_builder_remove_node.check(move || {

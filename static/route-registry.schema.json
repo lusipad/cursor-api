@@ -1,284 +1,348 @@
 {
-    "$schema": "http://json-schema.org/draft-07/schema#",
-    "$id": "https://example.com/schemas/route-registry.json",
-    "title": "Route Registry",
-    "description": "前端资源路由注册表，定义URL路径与资源的映射关系",
-    "type": "object",
-    "properties": {
-        "name": {
-            "type": "string",
-            "description": "前端包名称",
-            "examples": ["my-frontend-app"]
-        },
-        "version": {
-            "type": "string",
-            "description": "版本号（建议遵循 Semantic Versioning）",
-            "pattern": "^\\d+\\.\\d+\\.\\d+(-[a-zA-Z0-9.-]+)?(\\+[a-zA-Z0-9.-]+)?$",
-            "examples": ["1.0.0", "2.1.3-beta.1"]
-        },
-        "description": {
-            "type": "string",
-            "description": "前端包描述",
-            "examples": ["Modern web application frontend"]
-        },
-        "author": {
-            "type": "string",
-            "description": "作者信息",
-            "examples": ["John Doe <john@example.com>"]
-        },
-        "license": {
-            "type": "string",
-            "description": "许可证类型",
-            "examples": ["MIT", "Apache-2.0", "GPL-3.0"]
-        },
-        "routes": {
-            "type": "object",
-            "description": "路由映射表，键为URL路径，值为路由定义",
-            "additionalProperties": {
-                "$ref": "#/definitions/RouteDefinition"
-            },
-            "examples": [
-                {
-                    "/": "index.html",
-                    "/app.js": "dist/app.js",
-                    "/api": {
-                        "type": "file",
-                        "path": "api.json",
-                        "content_type": "application/json"
-                    }
-                }
-            ]
-        }
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://example.com/schemas/route-registry.json",
+  "title": "Route Registry",
+  "description": "前端资源路由注册表，定义URL路径与资源的映射关系",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "前端包名称",
+      "examples": [
+        "my-frontend-app"
+      ]
     },
-    "required": ["routes"],
-    "additionalProperties": false,
-    "definitions": {
-        "RouteDefinition": {
-            "title": "Route Definition",
-            "description": "路由定义，支持简写（字符串）和完整格式（对象）",
-            "oneOf": [
-                {
-                    "type": "string",
-                    "description": "简写格式：直接指定文件路径，自动创建 File 类型路由",
-                    "examples": ["index.html", "dist/app.js", "assets/logo.png"]
-                },
-                {
-                    "$ref": "#/definitions/RouteDef"
-                }
-            ]
-        },
-        "RouteDef": {
-            "title": "Route Definition Object",
-            "description": "完整的路由定义对象",
-            "type": "object",
-            "oneOf": [
-                {
-                    "$ref": "#/definitions/FileRoute"
-                },
-                {
-                    "$ref": "#/definitions/EmptyRoute"
-                },
-                {
-                    "$ref": "#/definitions/ExchangeRoute"
-                }
-            ]
-        },
-        "FileRoute": {
-            "title": "File Route",
-            "description": "文件路由：返回静态文件内容",
-            "type": "object",
-            "properties": {
-                "type": {
-                    "type": "string",
-                    "const": "file",
-                    "description": "路由类型标识"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "文件相对路径（相对于资源包根目录）",
-                    "examples": [
-                        "index.html",
-                        "assets/app.js",
-                        "dist/bundle.min.js"
-                    ]
-                },
-                "content_type": {
-                    "type": "string",
-                    "description": "HTTP Content-Type 响应头（可选，未指定时从文件扩展名推断）",
-                    "enum": [
-                        "text_html_utf8",
-                        "text_plain_utf8",
-                        "text_css_utf8",
-                        "application_javascript_utf8",
-                        "text_csv_utf8",
-                        "text_xml_utf8",
-                        "text_markdown_utf8",
-                        "image_jpeg",
-                        "image_png",
-                        "image_gif",
-                        "image_webp",
-                        "image_svg_xml",
-                        "image_bmp",
-                        "image_ico",
-                        "image_tiff",
-                        "image_avif",
-                        "audio_mpeg",
-                        "audio_mp4",
-                        "audio_wav",
-                        "audio_ogg",
-                        "audio_webm",
-                        "audio_aac",
-                        "audio_flac",
-                        "audio_m4a",
-                        "video_mp4",
-                        "video_mpeg",
-                        "video_webm",
-                        "video_ogg",
-                        "video_avi",
-                        "video_quicktime",
-                        "video_x_flv",
-                        "application_pdf",
-                        "application_msword",
-                        "application_word_docx",
-                        "application_excel_xls",
-                        "application_excel_xlsx",
-                        "application_powerpoint_ppt",
-                        "application_powerpoint_pptx",
-                        "application_zip",
-                        "application_rar",
-                        "application_7z",
-                        "application_gzip",
-                        "application_tar",
-                        "font_ttf",
-                        "font_otf",
-                        "font_woff",
-                        "font_woff2",
-                        "application_octet_stream"
-                    ],
-                    "examples": [
-                        "text_html_utf8",
-                        "application_javascript_utf8",
-                        "image_png",
-                        "application_json"
-                    ]
-                }
-            },
-            "required": ["type", "path"],
-            "additionalProperties": false
-        },
-        "EmptyRoute": {
-            "title": "Empty Route",
-            "description": "空响应路由：返回仅包含状态码和头的响应（无 body），常用于重定向、CORS 预检等",
-            "type": "object",
-            "properties": {
-                "type": {
-                    "type": "string",
-                    "const": "empty",
-                    "description": "路由类型标识"
-                },
-                "status": {
-                    "type": "integer",
-                    "description": "HTTP 状态码",
-                    "minimum": 100,
-                    "maximum": 999,
-                    "examples": [200, 301, 302, 304, 404]
-                },
-                "headers": {
-                    "type": "array",
-                    "description": "响应头列表",
-                    "items": {
-                        "$ref": "#/definitions/Header"
-                    },
-                    "examples": [
-                        [["Location", "https://example.com"]],
-                        [
-                            ["Access-Control-Allow-Origin", "*"],
-                            ["Access-Control-Allow-Methods", "GET, POST"]
-                        ]
-                    ]
-                }
-            },
-            "required": ["type", "status", "headers"],
-            "additionalProperties": false
-        },
-        "ExchangeRoute": {
-            "title": "Exchange Route",
-            "description": "交换内置路由",
-            "type": "object",
-            "properties": {
-                "type": {
-                    "type": "string",
-                    "const": "exchange",
-                    "description": "路由类型标识"
-                },
-                "from": {
-                    "type": "string",
-                    "description": "原始路由路径",
-                    "examples": ["/env-example", "/readme"]
-                }
-            },
-            "required": ["type", "from"],
-            "additionalProperties": false
-        },
-        "Header": {
-            "title": "HTTP Header",
-            "description": "HTTP 响应头键值对",
-            "type": "array",
-            "items": [
-                {
-                    "type": "string",
-                    "description": "Header 名称（符合 HTTP 规范）",
-                    "pattern": "^[!#$%&'*+\\-.0-9A-Z^_`a-z|~]+$",
-                    "examples": ["Content-Type", "Location", "Cache-Control"]
-                },
-                {
-                    "type": "string",
-                    "description": "Header 值（可打印 ASCII 字符）",
-                    "examples": [
-                        "application/json",
-                        "https://example.com",
-                        "max-age=3600"
-                    ]
-                }
-            ],
-            "minItems": 2,
-            "maxItems": 2
-        }
+    "version": {
+      "type": "string",
+      "description": "版本号（建议遵循 Semantic Versioning）",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(-[a-zA-Z0-9.-]+)?(\\+[a-zA-Z0-9.-]+)?$",
+      "examples": [
+        "1.0.0",
+        "2.1.3-beta.1"
+      ]
     },
-    "examples": [
+    "description": {
+      "type": "string",
+      "description": "前端包描述",
+      "examples": [
+        "Modern web application frontend"
+      ]
+    },
+    "author": {
+      "type": "string",
+      "description": "作者信息",
+      "examples": [
+        "John Doe <john@example.com>"
+      ]
+    },
+    "license": {
+      "type": "string",
+      "description": "许可证类型",
+      "examples": [
+        "MIT",
+        "Apache-2.0",
+        "GPL-3.0"
+      ]
+    },
+    "routes": {
+      "type": "object",
+      "description": "路由映射表，键为URL路径，值为路由定义",
+      "additionalProperties": {
+        "$ref": "#/definitions/RouteDefinition"
+      },
+      "examples": [
         {
-            "name": "example-frontend",
-            "version": "1.0.0",
-            "description": "示例前端应用",
-            "author": "Developer Team",
-            "license": "MIT",
-            "routes": {
-                "/": "index.html",
-                "/app.js": "dist/app.js",
-                "/style.css": "dist/style.css",
-                "/api/config.json": {
-                    "type": "file",
-                    "path": "config/api.json",
-                    "content_type": "application/json"
-                },
-                "/redirect": {
-                    "type": "empty",
-                    "status": 301,
-                    "headers": [["Location", "https://example.com"]]
-                },
-                "/cors-preflight": {
-                    "type": "empty",
-                    "status": 204,
-                    "headers": [
-                        ["Access-Control-Allow-Origin", "*"],
-                        [
-                            "Access-Control-Allow-Methods",
-                            "GET, POST, PUT, DELETE"
-                        ],
-                        ["Access-Control-Max-Age", "86400"]
-                    ]
-                }
-            }
+          "/": "index.html",
+          "/app.js": "dist/app.js",
+          "/api": {
+            "type": "file",
+            "path": "api.json",
+            "content_type": "application/json"
+          }
         }
-    ]
+      ]
+    }
+  },
+  "required": [
+    "routes"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "RouteDefinition": {
+      "title": "Route Definition",
+      "description": "路由定义，支持简写（字符串）和完整格式（对象）",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "简写格式：直接指定文件路径，自动创建 File 类型路由",
+          "examples": [
+            "index.html",
+            "dist/app.js",
+            "assets/logo.png"
+          ]
+        },
+        {
+          "$ref": "#/definitions/RouteDef"
+        }
+      ]
+    },
+    "RouteDef": {
+      "title": "Route Definition Object",
+      "description": "完整的路由定义对象",
+      "type": "object",
+      "oneOf": [
+        {
+          "$ref": "#/definitions/FileRoute"
+        },
+        {
+          "$ref": "#/definitions/EmptyRoute"
+        },
+        {
+          "$ref": "#/definitions/ExchangeRoute"
+        }
+      ]
+    },
+    "FileRoute": {
+      "title": "File Route",
+      "description": "文件路由：返回静态文件内容",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "file",
+          "description": "路由类型标识"
+        },
+        "path": {
+          "type": "string",
+          "description": "文件相对路径（相对于资源包根目录）",
+          "examples": [
+            "index.html",
+            "assets/app.js",
+            "dist/bundle.min.js"
+          ]
+        },
+        "content_type": {
+          "type": "string",
+          "description": "HTTP Content-Type 响应头（可选，未指定时从文件扩展名推断）",
+          "enum": [
+            "text_html_utf8",
+            "text_plain_utf8",
+            "text_css_utf8",
+            "application_javascript_utf8",
+            "text_csv_utf8",
+            "text_xml_utf8",
+            "text_markdown_utf8",
+            "image_jpeg",
+            "image_png",
+            "image_gif",
+            "image_webp",
+            "image_svg_xml",
+            "image_bmp",
+            "image_ico",
+            "image_tiff",
+            "image_avif",
+            "audio_mpeg",
+            "audio_mp4",
+            "audio_wav",
+            "audio_ogg",
+            "audio_webm",
+            "audio_aac",
+            "audio_flac",
+            "audio_m4a",
+            "video_mp4",
+            "video_mpeg",
+            "video_webm",
+            "video_ogg",
+            "video_avi",
+            "video_quicktime",
+            "video_x_flv",
+            "application_pdf",
+            "application_msword",
+            "application_word_docx",
+            "application_excel_xls",
+            "application_excel_xlsx",
+            "application_powerpoint_ppt",
+            "application_powerpoint_pptx",
+            "application_zip",
+            "application_rar",
+            "application_7z",
+            "application_gzip",
+            "application_tar",
+            "font_ttf",
+            "font_otf",
+            "font_woff",
+            "font_woff2",
+            "application_octet_stream"
+          ],
+          "examples": [
+            "text_html_utf8",
+            "application_javascript_utf8",
+            "image_png",
+            "application_json"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "path"
+      ],
+      "additionalProperties": false
+    },
+    "EmptyRoute": {
+      "title": "Empty Route",
+      "description": "空响应路由：返回仅包含状态码和头的响应（无 body），常用于重定向、CORS 预检等",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "empty",
+          "description": "路由类型标识"
+        },
+        "status": {
+          "type": "integer",
+          "description": "HTTP 状态码",
+          "minimum": 100,
+          "maximum": 999,
+          "examples": [
+            200,
+            301,
+            302,
+            304,
+            404
+          ]
+        },
+        "headers": {
+          "type": "array",
+          "description": "响应头列表",
+          "items": {
+            "$ref": "#/definitions/Header"
+          },
+          "examples": [
+            [
+              [
+                "Location",
+                "https://example.com"
+              ]
+            ],
+            [
+              [
+                "Access-Control-Allow-Origin",
+                "*"
+              ],
+              [
+                "Access-Control-Allow-Methods",
+                "GET, POST"
+              ]
+            ]
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "status",
+        "headers"
+      ],
+      "additionalProperties": false
+    },
+    "ExchangeRoute": {
+      "title": "Exchange Route",
+      "description": "交换内置路由",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "exchange",
+          "description": "路由类型标识"
+        },
+        "from": {
+          "type": "string",
+          "description": "原始路由路径",
+          "examples": [
+            "/env-example",
+            "/readme"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "from"
+      ],
+      "additionalProperties": false
+    },
+    "Header": {
+      "title": "HTTP Header",
+      "description": "HTTP 响应头键值对",
+      "type": "array",
+      "items": [
+        {
+          "type": "string",
+          "description": "Header 名称（符合 HTTP 规范）",
+          "pattern": "^[!#$%&'*+\\-.0-9A-Z^_`a-z|~]+$",
+          "examples": [
+            "Content-Type",
+            "Location",
+            "Cache-Control"
+          ]
+        },
+        {
+          "type": "string",
+          "description": "Header 值（可打印 ASCII 字符）",
+          "examples": [
+            "application/json",
+            "https://example.com",
+            "max-age=3600"
+          ]
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    }
+  },
+  "examples": [
+    {
+      "name": "example-frontend",
+      "version": "1.0.0",
+      "description": "示例前端应用",
+      "author": "Developer Team",
+      "license": "MIT",
+      "routes": {
+        "/": "index.html",
+        "/app.js": "dist/app.js",
+        "/style.css": "dist/style.css",
+        "/api/config.json": {
+          "type": "file",
+          "path": "config/api.json",
+          "content_type": "application/json"
+        },
+        "/redirect": {
+          "type": "empty",
+          "status": 301,
+          "headers": [
+            [
+              "Location",
+              "https://example.com"
+            ]
+          ]
+        },
+        "/cors-preflight": {
+          "type": "empty",
+          "status": 204,
+          "headers": [
+            [
+              "Access-Control-Allow-Origin",
+              "*"
+            ],
+            [
+              "Access-Control-Allow-Methods",
+              "GET, POST, PUT, DELETE"
+            ],
+            [
+              "Access-Control-Max-Age",
+              "86400"
+            ]
+          ]
+        }
+      }
+    }
+  ]
 }

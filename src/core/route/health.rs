@@ -59,7 +59,7 @@ pub async fn handle_health(
                 "horizon",
                 #[cfg(feature = "__preview")]
                 "preview",
-                #[cfg(feature = "__compat")]
+                #[cfg(not(feature = "__perf"))]
                 "compat",
             ],
         },

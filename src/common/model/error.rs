@@ -86,9 +86,7 @@ impl ErrorExt for ChatError {
         (self.status_code(), InfallibleJson(self.to_openai()))
     }
     #[inline]
-    fn into_anthropic_tuple(
-        self,
-    ) -> (http::StatusCode, InfallibleJson<anthropic::AnthropicError>) {
+    fn into_anthropic_tuple(self) -> (http::StatusCode, InfallibleJson<anthropic::AnthropicError>) {
         (self.status_code(), InfallibleJson(self.to_anthropic()))
     }
 }

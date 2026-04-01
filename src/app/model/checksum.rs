@@ -1,11 +1,10 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use core::fmt;
-use core::str::FromStr;
-
-use super::hash::{Hash, HashError};
-use super::timestamp_header;
-use crate::common::utils::hex::HEX_TABLE;
+use super::{
+    hash::{Hash, HashError},
+    timestamp_header,
+};
+use core::{fmt, str::FromStr};
 
 #[derive(Debug)]
 pub enum ChecksumError {
@@ -184,26 +183,10 @@ const fn is_valid_timestamp(bytes: &[u8; 8]) -> bool {
 
 // 解码 64 字符的十六进制字符串为 Hash
 #[inline]
-const fn decode_hex_hash(hex_bytes: &[u8; 64]) -> Option<Hash> {
+fn decode_hex_hash(hex_bytes: &[u8; 64]) -> Option<Hash> {
     let mut result = [0u8; 32];
-    let mut i = 0;
 
-    while i < 32 {
-        let pos = i * 2;
-        let hi = hex_bytes[pos];
-        let lo = hex_bytes[pos + 1];
-
-        let high = HEX_TABLE[hi as usize];
-        let low = HEX_TABLE[lo as usize];
-
-        // 检查是否为有效的十六进制字符
-        if high == 0xFF || low == 0xFF {
-            return None;
-        }
-
-        result[i] = (high << 4) | low;
-        i += 1;
-    }
+    hex_simd::decode(hex_bytes, hex_simd::Out::from_slice(&mut result)).ok()?;
 
     Some(Hash::from_bytes(result))
 }

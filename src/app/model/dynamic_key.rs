@@ -1,11 +1,11 @@
 use super::token::RawToken;
 use crate::{
     app::constant::{TYPE_SESSION, TYPE_WEB},
-    common::utils::hex_to_byte,
+    common::utils::hex::hex_to_byte,
 };
 use alloc::sync::Arc;
 use arc_swap::ArcSwap;
-use hmac::{Hmac, KeyInit as _, Mac as _};
+use hmac::{Hmac, KeyInit, Mac as _};
 use manually_init::ManuallyInit;
 use sha2::{
     Digest as _, Sha256,
@@ -20,58 +20,44 @@ impl Secret {
             return Secret(None);
         };
 
-        let mut result = [0; 64];
+        let mut result = [0u8; 64];
 
-        if let Some(s) = s.strip_prefix("hex:")
-            && s.len() >= 64
+        if let Some(hex_str) = s.strip_prefix("hex:")
+            && hex_str.len() >= 64
         {
-            let bytes = s.as_bytes();
-            let (hex_pairs, hex_rests) = bytes.as_chunks();
+            let hex_bytes = hex_str.as_bytes();
+            let cap = hex_bytes.len().min(128);
+            let even = cap & !1; // 向下对齐偶数，因为奇数会被 ensure! 拒绝
 
-            let mut ok = true;
-
-            for (&[hi, lo], dst) in hex_pairs.iter().zip(&mut result) {
-                let Some(byte) = hex_to_byte(hi, lo) else {
-                    ok = false;
-                    break;
-                };
-                *dst = byte;
-            }
-
-            if ok
-                && hex_pairs.len() < result.len()
-                && let Some(&hi) = hex_rests.first()
-            {
-                if let Some(byte) = hex_to_byte(hi, b'0') {
-                    result[hex_pairs.len()] = byte;
-                } else {
-                    ok = false;
-                };
-            }
-
-            if ok {
+            if let Ok(decoded) = hex_simd::decode(
+                &hex_bytes[..even],
+                hex_simd::Out::from_slice(&mut result), // 64 >= even/2，直接传整个数组
+            ) {
+                let n = decoded.len();
+                if even < cap && n < 64 {
+                    if let Some(b) = hex_to_byte(hex_bytes[even], b'0') {
+                        result[n] = b;
+                    }
+                }
                 return Secret(Some(result));
             }
         }
 
-        let out = {
-            let ptr: *mut [u8; 32] = result.as_mut_ptr().cast();
-            unsafe { &mut *ptr }
-        };
+        let out: &mut [u8; 32] = unsafe { &mut *result.as_mut_ptr().cast() };
         FixedOutput::finalize_into(Sha256::new().chain_update(s), out.into());
 
         Secret(Some(result))
     }
 }
 
-static INSTANCE: ManuallyInit<ArcSwap<Hmac<Sha256>>> = ManuallyInit::new();
+static KEY: ManuallyInit<ArcSwap<Hmac<Sha256>>> = ManuallyInit::new();
 
-pub fn init(secret: [u8; 64]) { INSTANCE.init(ArcSwap::from_pointee(Hmac::new(&Array(secret)))) }
+pub fn init(secret: [u8; 64]) { KEY.init(ArcSwap::from_pointee(KeyInit::new(&Array(secret)))) }
 
-pub fn update(secret: [u8; 64]) { INSTANCE.store(Arc::new(Hmac::new(&Array(secret)))) }
+pub fn update(secret: [u8; 64]) { KEY.store(Arc::new(KeyInit::new(&Array(secret)))) }
 
 pub fn get_hash(raw: &RawToken) -> [u8; 32] {
-    let mut hmac = (**INSTANCE.get().load()).clone();
+    let mut hmac = KEY.get().load().as_ref().clone();
     hmac.update(b"subject");
     hmac.update(raw.subject.provider.as_str().as_bytes());
     hmac.update(raw.subject.id.as_bytes());
@@ -84,7 +70,9 @@ pub fn get_hash(raw: &RawToken) -> [u8; 32] {
     hmac.update(&raw.randomness.to_bytes());
     hmac.update(b"type");
     hmac.update(if raw.is_session { TYPE_SESSION } else { TYPE_WEB }.as_bytes());
-    hmac.update(b"workos\x1fsession\x1fid");
-    hmac.update(raw.workos_session_id.as_bytes());
+    if !raw.workos_session_id.is_empty() {
+        hmac.update(b"workos\x1fsession\x1fid");
+        hmac.update(raw.workos_session_id.as_bytes());
+    }
     hmac.finalize_fixed().0
 }

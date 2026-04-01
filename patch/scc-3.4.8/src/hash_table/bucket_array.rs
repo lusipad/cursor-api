@@ -5,12 +5,13 @@ use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Acquire, Relaxed};
 
-use sdd::{AtomicShared, Tag};
+use sdd::{AtomicRaw, RawPtr};
 
 use super::bucket::{BUCKET_LEN, Bucket, INDEX, LruList};
 use crate::Guard;
 use crate::data_block::DataBlock;
 use crate::exit_guard::ExitGuard;
+use crate::utils::{fake_ref, get_owned, unwrap_unchecked};
 
 /// [`BucketArray`] is a special purpose array to manage [`Bucket`] and [`DataBlock`].
 pub struct BucketArray<K, V, L: LruList, const TYPE: char> {
@@ -19,7 +20,8 @@ pub struct BucketArray<K, V, L: LruList, const TYPE: char> {
     array_len: usize,
     hash_offset: u8,
     sample_size: u8,
-    linked_array: AtomicShared<BucketArray<K, V, L, TYPE>>,
+    bucket_ptr_offset: u16,
+    linked_array: AtomicRaw<BucketArray<K, V, L, TYPE>>,
     num_cleared_buckets: AtomicUsize,
 }
 
@@ -29,7 +31,7 @@ impl<K, V, L: LruList, const TYPE: char> BucketArray<K, V, L, TYPE> {
     /// `capacity` is the desired number of entries, not the length of the bucket array.
     pub(crate) fn new(
         capacity: usize,
-        linked_array: AtomicShared<BucketArray<K, V, L, TYPE>>,
+        linked_array: AtomicRaw<BucketArray<K, V, L, TYPE>>,
     ) -> Self {
         let adjusted_capacity = capacity
             .min(1_usize << (usize::BITS - 2))
@@ -40,28 +42,35 @@ impl<K, V, L: LruList, const TYPE: char> BucketArray<K, V, L, TYPE> {
         assert_eq!(1_usize << log2_array_len, array_len);
 
         let sample_size = log2_array_len.next_power_of_two();
+        let alignment = align_of::<Bucket<K, V, L, TYPE>>();
         let layout = Self::bucket_array_layout(array_len);
 
         unsafe {
-            let Some(bucket_array_ptr) = NonNull::new(alloc_zeroed(layout)) else {
-                panic!("memory allocation failure: {layout:?}");
+            let Some(unaligned_bucket_array_ptr) = NonNull::new(alloc_zeroed(layout)) else {
+                panic!("Memory allocation failed: {layout:?}");
             };
+            let bucket_array_ptr_offset = unaligned_bucket_array_ptr.align_offset(alignment);
+            assert_eq!(
+                (unaligned_bucket_array_ptr.addr().get() + bucket_array_ptr_offset) % alignment,
+                0
+            );
 
-            let data_block_array_layout = Layout::from_size_align(
-                size_of::<DataBlock<K, V, BUCKET_LEN>>() * array_len,
-                align_of::<[DataBlock<K, V, BUCKET_LEN>; 0]>(),
-            )
-            .unwrap();
+            #[allow(clippy::cast_ptr_alignment)] // The alignment was just asserted.
+            let buckets = unaligned_bucket_array_ptr
+                .add(bucket_array_ptr_offset)
+                .cast::<Bucket<K, V, L, TYPE>>();
+            let bucket_array_ptr_offset = u16::try_from(bucket_array_ptr_offset).unwrap_or(0);
 
             // In case the below data block allocation fails, deallocate the bucket array.
             let alloc_guard = ExitGuard::new((), |()| {
-                dealloc(bucket_array_ptr.as_ptr(), layout);
+                dealloc(unaligned_bucket_array_ptr.cast::<u8>().as_ptr(), layout);
             });
 
+            let data_block_layout = Self::data_block_layout(array_len);
             let Some(data_blocks) =
-                NonNull::new(alloc(data_block_array_layout).cast::<DataBlock<K, V, BUCKET_LEN>>())
+                NonNull::new(alloc(data_block_layout).cast::<DataBlock<K, V, BUCKET_LEN>>())
             else {
-                panic!("memory allocation failure: {data_block_array_layout:?}");
+                panic!("Memory allocation failed: {data_block_layout:?}");
             };
             alloc_guard.forget();
 
@@ -72,11 +81,12 @@ impl<K, V, L: LruList, const TYPE: char> BucketArray<K, V, L, TYPE> {
             }
 
             Self {
-                buckets: bucket_array_ptr.cast::<Bucket<K, V, L, TYPE>>(),
+                buckets,
                 data_blocks,
                 array_len,
                 hash_offset: u8::try_from(u64::BITS).unwrap_or(64) - log2_array_len,
                 sample_size,
+                bucket_ptr_offset: bucket_array_ptr_offset,
                 linked_array,
                 num_cleared_buckets: AtomicUsize::new(0),
             }
@@ -211,13 +221,13 @@ impl<K, V, L: LruList, const TYPE: char> BucketArray<K, V, L, TYPE> {
 
     /// Returns `true` if an linked bucket array exists.
     #[inline]
-    pub(crate) fn has_linked_array(&self) -> bool {
-        !self.linked_array.is_null(Acquire)
+    pub(crate) fn has_linked_array(&self, guard: &Guard) -> bool {
+        self.linked_array.load(Acquire, guard) != RawPtr::null()
     }
 
     /// Returns a reference to the linked bucket array pointer.
     #[inline]
-    pub(crate) const fn linked_array_var(&self) -> &AtomicShared<BucketArray<K, V, L, TYPE>> {
+    pub(crate) const fn linked_array_var(&self) -> &AtomicRaw<BucketArray<K, V, L, TYPE>> {
         &self.linked_array
     }
 
@@ -227,27 +237,41 @@ impl<K, V, L: LruList, const TYPE: char> BucketArray<K, V, L, TYPE> {
         &self,
         guard: &'g Guard,
     ) -> Option<&'g BucketArray<K, V, L, TYPE>> {
-        unsafe { self.linked_array.load(Acquire, guard).as_ref_unchecked() }
+        unsafe {
+            self.linked_array
+                .load(Acquire, guard)
+                .into_ptr()
+                .as_ref_unchecked()
+        }
     }
 
     /// Calculates the layout of the memory block for an array of `T`.
     #[inline]
     const fn bucket_array_layout(array_len: usize) -> Layout {
-        let allocation_size = array_len * size_of::<Bucket<K, V, L, TYPE>>();
-        unsafe {
-            Layout::from_size_align_unchecked(allocation_size, align_of::<Bucket<K, V, L, TYPE>>())
-        }
+        let size_of_t = size_of::<Bucket<K, V, L, TYPE>>();
+        let allocation_size = (array_len + 1) * size_of_t;
+        // Intentionally misaligned in order to take full advantage of demand paging.
+        unsafe { Layout::from_size_align_unchecked(allocation_size, 1) }
+    }
+
+    /// Returns the layout of the data array.
+    #[inline]
+    fn data_block_layout(array_len: usize) -> Layout {
+        unwrap_unchecked(
+            Layout::from_size_align(
+                size_of::<DataBlock<K, V, BUCKET_LEN>>() * array_len,
+                align_of::<[DataBlock<K, V, BUCKET_LEN>; 0]>(),
+            )
+            .ok(),
+        )
     }
 }
 
 impl<K, V, L: LruList, const TYPE: char> Drop for BucketArray<K, V, L, TYPE> {
     fn drop(&mut self) {
-        if !self.linked_array.is_null(Relaxed) {
+        if let Some(bucket_array) = get_owned(self.linked_array.load(Relaxed, fake_ref(self))) {
             unsafe {
-                self.linked_array
-                    .swap((None, Tag::None), Relaxed)
-                    .0
-                    .map(|a| a.drop_in_place());
+                bucket_array.drop_in_place();
             }
         }
 
@@ -269,16 +293,15 @@ impl<K, V, L: LruList, const TYPE: char> Drop for BucketArray<K, V, L, TYPE> {
 
         unsafe {
             dealloc(
-                self.buckets.cast::<u8>().as_ptr(),
+                self.buckets
+                    .cast::<u8>()
+                    .sub(self.bucket_ptr_offset as usize)
+                    .as_ptr(),
                 Self::bucket_array_layout(self.array_len),
             );
             dealloc(
                 self.data_blocks.cast::<u8>().as_ptr(),
-                Layout::from_size_align(
-                    size_of::<DataBlock<K, V, BUCKET_LEN>>() * self.array_len,
-                    align_of::<[DataBlock<K, V, BUCKET_LEN>; 0]>(),
-                )
-                .unwrap(),
+                Self::data_block_layout(self.array_len),
             );
         }
     }

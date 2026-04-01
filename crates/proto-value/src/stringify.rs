@@ -18,69 +18,50 @@ mod private {
         fn deserialize_from<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error>;
     }
 
-    impl BigInt for i64 {
-        #[inline(always)]
-        fn serialize_to<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.serialize_str(itoa::Buffer::new().format(*self))
-        }
-
-        #[inline(always)]
-        fn deserialize_from<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            deserializer.deserialize_any(BigIntVisitor::<Self>(PhantomData))
-        }
-    }
-
-    impl BigInt for u64 {
-        #[inline(always)]
-        fn serialize_to<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.serialize_str(itoa::Buffer::new().format(*self))
-        }
-
-        #[inline(always)]
-        fn deserialize_from<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            deserializer.deserialize_any(BigIntVisitor::<Self>(PhantomData))
-        }
-    }
-
     struct BigIntVisitor<T: BigInt>(PhantomData<T>);
 
-    impl<'de> de::Visitor<'de> for BigIntVisitor<i64> {
-        type Value = i64;
+    macro_rules! impl_bigint {
+        ($($ty:ty => $expecting:expr),* $(,)?) => {$(
+            impl BigInt for $ty {
+                #[inline(always)]
+                fn serialize_to<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                    serializer.serialize_str(itoa::Buffer::new().format(*self))
+                }
+                #[inline(always)]
+                fn deserialize_from<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                    deserializer.deserialize_any(BigIntVisitor::<Self>(PhantomData))
+                }
+            }
 
-        #[inline]
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("an integer or a string containing an integer")
-        }
+            impl<'de> de::Visitor<'de> for BigIntVisitor<$ty> {
+                type Value = $ty;
 
-        #[inline]
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> { Ok(v) }
+                #[inline]
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str($expecting)
+                }
 
-        #[inline]
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-            i64::try_from(v).map_err(|_| E::custom(format_args!("integer {v} is out of range")))
-        }
+                #[inline]
+                fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                    <$ty>::try_from(v).map_err(|_| E::custom(format_args!("integer {v} is out of range")))
+                }
 
-        #[inline]
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            v.parse().map_err(|_| E::custom(format_args!("invalid integer: {v}")))
-        }
+                #[inline]
+                fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                    <$ty>::try_from(v).map_err(|_| E::custom(format_args!("integer {v} is out of range")))
+                }
+
+                #[inline]
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                    v.parse().map_err(|_| E::custom(format_args!("invalid integer: {v}")))
+                }
+            }
+        )*};
     }
 
-    impl<'de> de::Visitor<'de> for BigIntVisitor<u64> {
-        type Value = u64;
-
-        #[inline]
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("an unsigned integer or a string containing an unsigned integer")
-        }
-
-        #[inline]
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> { Ok(v) }
-
-        #[inline]
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            v.parse().map_err(|_| E::custom(format_args!("invalid unsigned integer: {v}")))
-        }
+    impl_bigint! {
+        i64 => "an integer or a string containing an integer",
+        u64 => "an unsigned integer or a string containing an unsigned integer",
     }
 }
 
@@ -142,18 +123,6 @@ where T: private::BigInt
 }
 
 #[cfg(feature = "alloc")]
-struct SerializeItem<'a, T: Item>(&'a T);
-
-#[cfg(feature = "alloc")]
-impl<T: Item> Serialize for SerializeItem<'_, T> {
-    #[inline(always)]
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
-        self.0.serialize(serializer)
-    }
-}
-
-#[cfg(feature = "alloc")]
 struct RepeatVisitor<T>(PhantomData<T>);
 
 #[cfg(feature = "alloc")]
@@ -183,7 +152,7 @@ where T: private::BigInt
 {
     #[inline]
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.iter().map(SerializeItem))
+        serializer.collect_seq(self.iter().copied().map(Stringify))
     }
 
     #[inline]

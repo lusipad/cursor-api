@@ -1,7 +1,5 @@
 mod json;
 
-pub use json::{InfallibleSerialize, InfallibleJson, GenericJson, OpenAiJson, AnthropicJson};
-
 use super::{
     constant::{
         ROUTE_BUILD_KEY_PATH, ROUTE_CHAT_COMPLETIONS_PATH, ROUTE_CONFIG_EXAMPLE_PATH,
@@ -55,6 +53,7 @@ use axum::{
     Router, middleware,
     routing::{get, post},
 };
+pub use json::{AnthropicJson, GenericJson, InfallibleJson, InfallibleSerialize, OpenAiJson};
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 
 pub fn create_router(state: Arc<AppState>) -> Router {

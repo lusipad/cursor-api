@@ -6,10 +6,7 @@ use crate::{
         constant::UNKNOWN,
         model::{AppConfig, FetchMode, ModelIdSource},
     },
-    common::model::{
-        cached::JsonCached,
-        raw_json::RawJson,
-    },
+    common::model::{cached::JsonCached, raw_json::RawJson},
     core::model::ModelsResponse,
 };
 use alloc::sync::Arc;
@@ -74,6 +71,7 @@ def_const_models!(
     CLAUDE_4_OPUS_THINKING_LEGACY => "claude-4-opus-thinking-legacy",
 
     // Cursor 模型
+    COMPOSER_1_5 => "composer-1.5",
     COMPOSER_1 => "composer-1",
     CURSOR_SMALL => "cursor-small",
 
@@ -516,6 +514,8 @@ create_models! {
     CURSOR => [
         ModelIds::new(DEFAULT)
             .with_client_id("Auto"),
+        ModelIds::new(COMPOSER_1_5)
+            .with_client_id("Composer 1.5"),
         ModelIds::new(COMPOSER_1)
             .with_client_id("Composer 1"),
         ModelIds::new(CURSOR_SMALL)
@@ -664,7 +664,8 @@ pub const FREE_MODELS: [&str; 6] =
 //     [GPT_4O_128K, GEMINI_1_5_FLASH_500K, CLAUDE_3_HAIKU_200K, CLAUDE_3_5_SONNET_200K];
 
 // 支持思考的模型
-const SUPPORTED_THINKING_MODELS: [&str; 42] = [
+const SUPPORTED_THINKING_MODELS: [&str; 43] = [
+    COMPOSER_1_5,
     CLAUDE_4_5_OPUS_HIGH_THINKING,
     CLAUDE_4_5_SONNET_THINKING,
     GPT_5_1_CODEX_MAX,
@@ -710,8 +711,9 @@ const SUPPORTED_THINKING_MODELS: [&str; 42] = [
 ];
 
 // 支持图像的模型（DEFAULT 始终支持）
-const SUPPORTED_IMAGE_MODELS: [&str; 51] = [
+const SUPPORTED_IMAGE_MODELS: [&str; 52] = [
     DEFAULT,
+    COMPOSER_1_5,
     COMPOSER_1,
     CLAUDE_4_5_OPUS_HIGH,
     CLAUDE_4_5_OPUS_HIGH_THINKING,
@@ -765,8 +767,9 @@ const SUPPORTED_IMAGE_MODELS: [&str; 51] = [
 ];
 
 // 支持Max与非Max的模型
-const SUPPORTED_MAX_MODELS: [&str; 47] = [
+const SUPPORTED_MAX_MODELS: [&str; 48] = [
     DEFAULT,
+    COMPOSER_1_5,
     COMPOSER_1,
     CLAUDE_4_5_OPUS_HIGH,
     CLAUDE_4_5_OPUS_HIGH_THINKING,

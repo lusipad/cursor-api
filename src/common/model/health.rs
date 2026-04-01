@@ -5,6 +5,9 @@ use crate::{
 };
 use serde::Serialize;
 
+#[cfg(not(feature = "__perf"))]
+use serde_json as sonic_rs;
+
 #[derive(Serialize)]
 pub struct HealthCheckResponse {
     pub status: ApiStatus,
@@ -85,7 +88,7 @@ static mut SERVICE_INFO: &'static str = "";
 pub fn init_service_info() {
     unsafe {
         SERVICE_INFO = Box::leak(
-            serde_json::to_string(&ServiceInfo {
+            sonic_rs::to_string(&ServiceInfo {
                 name: crate::app::constant::PKG_NAME,
                 version: crate::app::constant::PKG_VERSION,
                 is_debug: *crate::app::lazy::log::DEBUG,

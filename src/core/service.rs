@@ -1,5 +1,3 @@
-// mod backend;
-// mod context;
 pub mod cpp;
 
 use crate::{
@@ -11,13 +9,13 @@ use crate::{
         },
         lazy::{AUTH_TOKEN, REAL_USAGE, chat_url, dry_chat_url},
         model::{
-            AppConfig, AppState, Chain, ChainUsage, DateTime, ErrorInfo, LogStatus, LogTokenInfo,
-            LogUpdate, QueueType, RequestLog, TimingInfo, TokenKey, UsageCheck, log_manager,
+            AppConfig, AppState, Chain, ChainUsage, DateTime, ErrorInfo, LogPatch, LogStatus,
+            LogTokenInfo, QueueType, RequestLog, TimingInfo, TokenKey, UsageCheck, log_manager,
         },
         route::{AnthropicJson, InfallibleJson, OpenAiJson},
     },
     common::{
-        client::{AiServiceRequest, build_client_request},
+        client::{AiServiceRequest, build_client_request, open_bidi_stream},
         model::{ApiStatus, GenericError, error::ChatError, tri::Tri},
         utils::{
             CollectBytes, TrimNewlines as _, get_available_models, get_token_profile,
@@ -38,6 +36,7 @@ use crate::{
         stream::{
             decoder::{StreamDecoder, StreamMessage, Thinking},
             droppable::DroppableStream,
+            session::{BidiSession, PendingToolCall, session_key},
         },
     },
 };
@@ -318,7 +317,7 @@ pub async fn handle_chat_completions(
                 // 更新日志中的profile
                 log_manager::update_log(
                     log_id,
-                    LogUpdate::TokenProfile(user.clone(), usage, stripe),
+                    LogPatch::TokenProfile(user.clone(), usage, stripe),
                 )
                 .await;
 
@@ -367,72 +366,172 @@ pub async fn handle_chat_completions(
 
     // 将消息转换为hex格式
     let msg_id = uuid::Uuid::new_v4();
-    let data = match super::adapter::openai::encode_create_params(
-        params,
-        tools,
-        ext_token.now(),
-        model,
-        msg_id,
-        environment_info,
-        current_config.disable_vision,
-        current_config.enable_slow_pool,
-    )
-    .await
-    {
-        Ok(data) => data,
-        Err(e) => {
-            log_manager::update_log(current_id, LogUpdate::Failure(e.to_log_error())).await;
-            state.decrement_active();
-            state.increment_error();
-            return Err(e.into_openai_tuple());
+    use super::adapter::chat_completions::{
+        SESSION_CACHE, encode_create_params, encode_tool_results, extract_last_tool_ids,
+        extract_tool_results,
+    };
+    let mut tool_ids = extract_last_tool_ids(&params);
+
+    // 尝试 resume
+    let resumed = 'resume: {
+        if tool_ids.is_empty() {
+            break 'resume None;
+        }
+        let key = session_key(&mut tool_ids);
+        drop(tool_ids);
+        let session = match SESSION_CACHE.get().take(key) {
+            Some(s) => s,
+            None => break 'resume None,
+        };
+
+        let tool_results = extract_tool_results(&params, &session.pending_tool_calls);
+
+        if tool_results.is_empty() {
+            SESSION_CACHE.get().park(key, session);
+            break 'resume None;
+        }
+
+        let frame = match encode_tool_results(tool_results).await {
+            Ok(f) => f,
+            Err(e) => {
+                log_manager::update_log(current_id, LogPatch::Failure(e.to_log_error())).await;
+                state.decrement_active();
+                state.increment_error();
+                return Err(e.into_openai_tuple());
+            }
+        };
+
+        if session.upstream_tx.send(Ok(frame.into())).await.is_err() {
+            // 上游已关闭，回退
+            break 'resume None;
+        }
+
+        Some((session.upstream_tx, session.byte_stream))
+    };
+
+    let (tx, byte_stream, decoder) = match resumed {
+        Some((tx, byte_stream)) => (tx, byte_stream, StreamDecoder::new().no_first_cache()),
+        None => {
+            let platform = environment_info.exthost_platform.clone();
+            let arch = environment_info.exthost_arch.clone();
+            let data = match encode_create_params(
+                params,
+                tools,
+                ext_token.now(),
+                model,
+                msg_id,
+                environment_info,
+                current_config.disable_vision,
+                current_config.enable_slow_pool,
+            )
+            .await
+            {
+                Ok(data) => data,
+                Err(e) => {
+                    log_manager::update_log(current_id, LogPatch::Failure(e.to_log_error())).await;
+                    state.decrement_active();
+                    state.increment_error();
+                    return Err(e.into_openai_tuple());
+                }
+            };
+
+            let req = build_client_request(AiServiceRequest {
+                ext_token: &ext_token,
+                fs_client_key: None,
+                url: chat_url(use_pri),
+                stream: true,
+                compressed: true,
+                trace_id: new_uuid_v4(),
+                use_pri,
+                cookie: None,
+                exact_length: None,
+                platform,
+                arch,
+            });
+
+            let (tx, response) = match open_bidi_stream(req, data.into()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let e = e.without_url();
+
+                    // 根据错误类型返回不同的状态码
+                    let status_code = if e.is_timeout() {
+                        StatusCode::GATEWAY_TIMEOUT
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    };
+                    crate::debug!("request: {e:?}");
+                    let e = e.to_string();
+
+                    // 更新请求日志为失败
+                    let error = Str::new(&e);
+                    log_manager::update_log(
+                        current_id,
+                        LogPatch::Failure(ErrorInfo::Simple(error)),
+                    )
+                    .await;
+                    state.decrement_active();
+                    state.increment_error();
+
+                    return Err(
+                        ChatError::RequestFailed(status_code, Cow::Owned(e)).into_openai_tuple()
+                    );
+                }
+            };
+
+            (tx, response.bytes_stream(), StreamDecoder::new())
         }
     };
+
+    log_manager::update_log(current_id, LogPatch::Success).await;
     let msg_id = MessageId::new(msg_id.as_bytes());
 
     // 构建请求客户端
-    let req = build_client_request(AiServiceRequest {
-        ext_token: &ext_token,
-        fs_client_key: None,
-        url: chat_url(use_pri),
-        stream: true,
-        compressed: true,
-        trace_id: new_uuid_v4(),
-        use_pri,
-        cookie: None,
-        exact_length: Some(data.len()),
-    });
+    // let req = build_client_request(AiServiceRequest {
+    //     ext_token: &ext_token,
+    //     fs_client_key: None,
+    //     url: chat_url(use_pri),
+    //     stream: true,
+    //     compressed: true,
+    //     trace_id: new_uuid_v4(),
+    //     use_pri,
+    //     cookie: None,
+    //     exact_length: Some(data.len()),
+    //     platform,
+    //     arch,
+    // });
     // crate::debug!("request: {req:?}");
     // 发送请求
-    let response = req.body(data).send().await;
+    // let response = open_bidi_stream(req, data.into()).await;
 
     // 处理请求结果
-    let response = match response {
-        Ok(resp) => {
-            // 更新请求日志为成功
-            log_manager::update_log(current_id, LogUpdate::Success).await;
-            resp
-        }
-        Err(e) => {
-            let e = e.without_url();
+    // let (tx, response) = match response {
+    //     Ok(resp) => {
+    //         // 更新请求日志为成功
+    //         log_manager::update_log(current_id, LogPatch::Success).await;
+    //         resp
+    //     }
+    //     Err(e) => {
+    //         let e = e.without_url();
 
-            // 根据错误类型返回不同的状态码
-            let status_code = if e.is_timeout() {
-                StatusCode::GATEWAY_TIMEOUT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            crate::debug!("request: {e:?}");
-            let e = e.to_string();
+    //         // 根据错误类型返回不同的状态码
+    //         let status_code = if e.is_timeout() {
+    //             StatusCode::GATEWAY_TIMEOUT
+    //         } else {
+    //             StatusCode::INTERNAL_SERVER_ERROR
+    //         };
+    //         crate::debug!("request: {e:?}");
+    //         let e = e.to_string();
 
-            // 更新请求日志为失败
-            let error = Str::new(&e);
-            log_manager::update_log(current_id, LogUpdate::Failure(ErrorInfo::Simple(error))).await;
-            state.decrement_active();
-            state.increment_error();
+    //         // 更新请求日志为失败
+    //         let error = Str::new(&e);
+    //         log_manager::update_log(current_id, LogPatch::Failure(ErrorInfo::Simple(error))).await;
+    //         state.decrement_active();
+    //         state.increment_error();
 
-            return Err(ChatError::RequestFailed(status_code, Cow::Owned(e)).into_openai_tuple());
-        }
-    };
+    //         return Err(ChatError::RequestFailed(status_code, Cow::Owned(e)).into_openai_tuple());
+    //     }
+    // };
 
     // 释放活动请求计数
     state.decrement_active();
@@ -451,10 +550,11 @@ pub async fn handle_chat_completions(
         });
         let index = Arc::new(AtomicU32::new(0));
         let start_time = std::time::Instant::now();
-        let decoder = Arc::new(Mutex::new(StreamDecoder::new()));
+        let decoder = Arc::new(Mutex::new(decoder));
         let stream_state = Arc::new(Atomic::new(StreamState::NotStarted));
         let last_content_type = Arc::new(Atomic::new(LastContentType::None));
         let is_need = stream_options.include_usage;
+        let pending_tool_calls = Arc::new(Mutex::new(Vec::new()));
 
         // 定义消息处理器的上下文结构体
         struct MessageProcessContext<'a> {
@@ -467,6 +567,7 @@ pub async fn handle_chat_completions(
             current_id: u64,
             created: i64,
             is_need: bool,
+            pending_tool_calls: &'a Mutex<Vec<PendingToolCall>>,
         }
 
         #[inline]
@@ -474,7 +575,7 @@ pub async fn handle_chat_completions(
         where T: serde::Serialize {
             vector.extend_from_slice(b"data: ");
             let vector = {
-                let mut ser = serde_json::Serializer::new(vector);
+                let mut ser = sonic_rs::Serializer::new(vector);
                 __unwrap!(serde::Serialize::serialize(value, &mut ser));
                 ser.into_inner()
             };
@@ -537,6 +638,12 @@ pub async fn handle_chat_completions(
                             ctx.stream_state
                                 .store(StreamState::ContentBlockActive, Ordering::Release);
                         }
+                        if tool_call.is_last {
+                            ctx.pending_tool_calls.lock().await.push(PendingToolCall {
+                                id: tool_call.id.clone(),
+                                name: tool_call.name.clone(),
+                            });
+                        }
 
                         let last_type = ctx.last_content_type.load(Ordering::Acquire);
                         if last_type != LastContentType::InputJson {
@@ -598,13 +705,23 @@ pub async fn handle_chat_completions(
                             usage: Tri::Null(ctx.is_need),
                         };
                         extend_from_slice(&mut response_data, &chunk);
+
+                        if tool_call.is_last {
+                            // 计算总时间和首次片段时间
+                            let total_time = ctx.start_time.elapsed().as_secs_f64();
+
+                            log_manager::update_log(ctx.current_id, LogPatch::Timing(total_time))
+                                .await;
+
+                            ctx.stream_state.store(StreamState::Completed, Ordering::Release);
+                            break;
+                        }
                     }
                     StreamMessage::StreamEnd => {
                         // 计算总时间和首次片段时间
                         let total_time = ctx.start_time.elapsed().as_secs_f64();
 
-                        log_manager::update_log(ctx.current_id, LogUpdate::Timing(total_time))
-                            .await;
+                        log_manager::update_log(ctx.current_id, LogPatch::Timing(total_time)).await;
 
                         ctx.stream_state.store(StreamState::Completed, Ordering::Release);
                         break;
@@ -634,7 +751,7 @@ pub async fn handle_chat_completions(
         }
 
         // 首先处理stream直到获得第一个结果
-        let (mut stream, drop_handle) = DroppableStream::new(response.bytes_stream());
+        let (mut stream, drop_handle) = DroppableStream::new(byte_stream);
         {
             let mut decoder = decoder.lock().await;
             while !decoder.is_first_result_ready() {
@@ -647,7 +764,7 @@ pub async fn handle_chat_completions(
                             // 更新请求日志为失败
                             log_manager::update_log(
                                 current_id,
-                                LogUpdate::Failure2(
+                                LogPatch::FailureTimed(
                                     canonical.to_error_info(),
                                     start_time.elapsed().as_secs_f64(),
                                 ),
@@ -671,7 +788,7 @@ pub async fn handle_chat_completions(
                         // 更新请求日志为失败
                         log_manager::update_log(
                             current_id,
-                            LogUpdate::Failure(ErrorInfo::Simple(Str::from_static(
+                            LogPatch::Failure(ErrorInfo::Simple(Str::from_static(
                                 ERR_STREAM_RESPONSE,
                             ))),
                         )
@@ -689,6 +806,8 @@ pub async fn handle_chat_completions(
 
         let response_id_clone = response_id.clone();
         let decoder_clone = decoder.clone();
+        let drop_handle_clone = drop_handle.clone();
+        let pending_tool_calls_clone = pending_tool_calls.clone();
 
         let created = DateTime::utc_now().timestamp();
 
@@ -700,7 +819,8 @@ pub async fn handle_chat_completions(
                 let index = index.clone();
                 let stream_state = stream_state.clone();
                 let last_content_type = last_content_type.clone();
-                let drop_handle = drop_handle.clone();
+                let drop_handle = drop_handle_clone.clone();
+                let pending_tool_calls = pending_tool_calls_clone.clone();
 
                 async move {
                     let chunk = match chunk {
@@ -721,6 +841,7 @@ pub async fn handle_chat_completions(
                         stream_state: &stream_state,
                         last_content_type: &last_content_type,
                         is_need,
+                        pending_tool_calls: &pending_tool_calls,
                     };
 
                     // 使用decoder处理chunk
@@ -738,7 +859,7 @@ pub async fn handle_chat_completions(
                                 }
                                 // 罕见
                                 StreamError::Upstream(e) => {
-                                    let message = __unwrap!(serde_json::to_string(&e.canonical().into_openai().wrapped()));
+                                    let message = __unwrap!(sonic_rs::to_string(&e.canonical().into_openai().wrapped()));
                                     let messages = [StreamMessage::Content(message), StreamMessage::StreamEnd];
                                     return Ok(Bytes::from(process_messages(messages, &ctx).await));
                                 }
@@ -778,15 +899,30 @@ pub async fn handle_chat_completions(
                 let content_delays = decoder_guard.take_content_delays();
                 let thinking_content = decoder_guard.take_thinking_content();
 
-                log_manager::update_log(current_id, LogUpdate::Delays(content_delays, thinking_content))
+                log_manager::update_log(current_id, LogPatch::Delays(content_delays, thinking_content))
                     .await;
+
+                let mut pending_tool_calls = pending_tool_calls.lock().await;
+                if !pending_tool_calls.is_empty() {
+                    let pending = core::mem::take(&mut *pending_tool_calls);
+                    let mut ids = pending.iter().map(|p| p.id.as_ref()).collect::<Vec<_>>();
+                    let key = session_key(&mut ids);
+                    drop(ids);
+                    if let Some(byte_stream) = drop_handle.take_stream() {
+                        SESSION_CACHE.get().park(key, BidiSession {
+                            upstream_tx: tx,
+                            byte_stream,
+                            pending_tool_calls: pending,
+                        });
+                    }
+                }
 
                 let usage = if *REAL_USAGE {
                     let usage =
                         get_token_usage(ext_token, use_pri, request_time, model.id)
                             .await;
                     if let Some(usage) = usage {
-                        log_manager::update_log(current_id, LogUpdate::Usage(usage))
+                        log_manager::update_log(current_id, LogPatch::Usage(usage))
                             .await;
                     }
                     usage.map(ChainUsage::into_openai)
@@ -851,11 +987,16 @@ pub async fn handle_chat_completions(
     } else {
         // 非流式响应
         let start_time = std::time::Instant::now();
-        let mut decoder = StreamDecoder::new().no_first_cache();
+        let mut decoder = decoder.no_first_cache();
         let mut thinking_text = String::with_capacity(128);
         let mut full_text = String::with_capacity(128);
         let mut tool_calls = Vec::new();
-        let mut stream = response.bytes_stream();
+        let mut tool_call_args = String::new();
+        let mut tool_call_id = None;
+        let mut tool_call_name = None;
+        let mut pending_tool_calls = Vec::new();
+        let mut stream = byte_stream;
+        let mut tool_call_finished = false;
         // let mut prompt = Prompt::None;
 
         // 逐个处理chunks
@@ -878,13 +1019,29 @@ pub async fn handle_chat_completions(
                                 thinking_text.push_str(&text)
                             }
                             StreamMessage::ToolCall(tool_call) => {
-                                tool_calls.push(openai::ChatCompletionMessageToolCall::Function {
-                                    id: tool_call.id,
-                                    function: openai::chat_completion_message_tool_call::Function {
-                                        arguments: tool_call.input,
-                                        name: tool_call.name,
-                                    },
-                                })
+                                if tool_call_id.is_none() {
+                                    tool_call_id = Some(tool_call.id.clone());
+                                    tool_call_name = Some(tool_call.name.clone());
+                                }
+                                tool_call_args.push_str(&tool_call.input);
+                                if tool_call.is_last {
+                                    pending_tool_calls.push(PendingToolCall {
+                                        id: tool_call.id.clone(),
+                                        name: tool_call.name.clone(),
+                                    });
+                                    tool_calls
+                                        .push(openai::ChatCompletionMessageToolCall::Function {
+                                        id: tool_call_id.take().unwrap_or(tool_call.id),
+                                        function:
+                                            openai::chat_completion_message_tool_call::Function {
+                                                arguments: core::mem::take(&mut tool_call_args),
+                                                name: tool_call_name
+                                                    .take()
+                                                    .unwrap_or(tool_call.name),
+                                            },
+                                    });
+                                    tool_call_finished = true;
+                                }
                             }
                             // StreamMessage::Debug(debug_prompt) => {
                             //     if prompt.is_none() {
@@ -902,11 +1059,14 @@ pub async fn handle_chat_completions(
                     let canonical = error.canonical();
                     log_manager::update_log(
                         current_id,
-                        LogUpdate::Failure(canonical.to_error_info()),
+                        LogPatch::Failure(canonical.to_error_info()),
                     )
                     .await;
                     state.increment_error();
-                    return Err((canonical.status_code(), InfallibleJson(canonical.into_openai().wrapped())));
+                    return Err((
+                        canonical.status_code(),
+                        InfallibleJson(canonical.into_openai().wrapped()),
+                    ));
                 }
                 Err(StreamError::EmptyStream) => {
                     let empty_stream_count = decoder.get_empty_stream_count();
@@ -918,16 +1078,30 @@ pub async fn handle_chat_completions(
                     }
                 }
             }
+
+            if tool_call_finished {
+                break;
+            }
+        }
+
+        if !pending_tool_calls.is_empty() {
+            let mut ids = pending_tool_calls.iter().map(|p| p.id.as_ref()).collect::<Vec<_>>();
+            let key = session_key(&mut ids);
+            drop(ids);
+            SESSION_CACHE.get().park(
+                key,
+                BidiSession { upstream_tx: tx, byte_stream: stream, pending_tool_calls },
+            );
         }
 
         full_text = full_text.trim_leading_newlines();
 
         // 检查响应是否为空
-        if full_text.is_empty() {
+        if full_text.is_empty() && tool_calls.is_empty() {
             // 更新请求日志为失败
             log_manager::update_log(
                 current_id,
-                LogUpdate::Failure(ErrorInfo::Simple(Str::from_static(ERR_RESPONSE_RECEIVED))),
+                LogPatch::Failure(ErrorInfo::Simple(Str::from_static(ERR_RESPONSE_RECEIVED))),
             )
             .await;
             state.increment_error();
@@ -966,7 +1140,7 @@ pub async fn handle_chat_completions(
                 },
                 message: openai::ChatCompletionMessage {
                     role: openai::Assistant,
-                    content: Some(full_text),
+                    content: (!full_text.is_empty()).then_some(full_text),
                     tool_calls,
                 },
                 logprobs: (),
@@ -981,7 +1155,7 @@ pub async fn handle_chat_completions(
 
         log_manager::update_log(
             current_id,
-            LogUpdate::TimingChain(
+            LogPatch::TimingChain(
                 total_time,
                 Chain { delays: content_delays, usage: chain_usage, think: thinking_content },
             ),
@@ -992,7 +1166,7 @@ pub async fn handle_chat_completions(
             tokio::spawn(usage_check);
         }
 
-        let data = __unwrap!(serde_json::to_vec(&response_data));
+        let data = __unwrap!(sonic_rs::to_vec(&response_data));
         Ok(__unwrap!(
             Response::builder()
                 .header(CACHE_CONTROL, NO_CACHE_REVALIDATE)
@@ -1018,7 +1192,7 @@ pub async fn handle_messages(
     } else {
         return Err(ChatError::ModelNotSupported(request.model).into_anthropic_tuple());
     };
-    let is_stream = request.stream;
+    let stream = request.stream;
     let (params, tools) = request.strip();
 
     // 验证请求
@@ -1096,7 +1270,7 @@ pub async fn handle_messages(
                 },
                 chain: Chain { delays: None, usage: None, think: None },
                 timing: TimingInfo { total: 0.0 },
-                stream: is_stream,
+                stream,
                 status: LogStatus::Pending,
                 error: ErrorInfo::Empty,
             },
@@ -1119,7 +1293,7 @@ pub async fn handle_messages(
                 // 更新日志中的profile
                 log_manager::update_log(
                     log_id,
-                    LogUpdate::TokenProfile(user.clone(), usage, stripe),
+                    LogPatch::TokenProfile(user.clone(), usage, stripe),
                 )
                 .await;
 
@@ -1167,74 +1341,195 @@ pub async fn handle_messages(
     }
 
     // 将消息转换为hex格式
-    let stream = is_stream;
     let msg_id = uuid::Uuid::new_v4();
-    let data = match super::adapter::anthropic::encode_create_params(
-        params,
-        tools,
-        ext_token.now(),
-        model,
-        msg_id,
-        environment_info,
-        current_config.disable_vision,
-        current_config.enable_slow_pool,
-    )
-    .await
-    {
-        Ok(data) => data,
-        Err(e) => {
-            log_manager::update_log(current_id, LogUpdate::Failure(e.to_log_error())).await;
-            state.decrement_active();
-            state.increment_error();
-            return Err(e.into_anthropic_tuple());
+    use super::adapter::messages::{
+        SESSION_CACHE, encode_create_params, encode_tool_results, extract_last_tool_ids,
+        extract_tool_results,
+    };
+    let mut tool_ids = extract_last_tool_ids(&params.0);
+    crate::debug!("{tool_ids:?}");
+    // 尝试 resume
+    let resumed = 'resume: {
+        if tool_ids.is_empty() {
+            break 'resume None;
+        }
+        let key = session_key(&mut tool_ids);
+        drop(tool_ids);
+        let session = match SESSION_CACHE.get().take(key) {
+            Some(s) => s,
+            None => break 'resume None,
+        };
+
+        let tool_results = extract_tool_results(&params.0, &session.pending_tool_calls);
+
+        if tool_results.is_empty() {
+            SESSION_CACHE.get().park(key, session);
+            break 'resume None;
+        }
+
+        let frame = match encode_tool_results(tool_results).await {
+            Ok(f) => f,
+            Err(e) => {
+                log_manager::update_log(current_id, LogPatch::Failure(e.to_log_error())).await;
+                state.decrement_active();
+                state.increment_error();
+                return Err(e.into_anthropic_tuple());
+            }
+        };
+
+        if session.upstream_tx.send(Ok(frame.into())).await.is_err() {
+            // 上游已关闭，回退
+            break 'resume None;
+        }
+
+        Some((session.upstream_tx, session.byte_stream))
+    };
+
+    let (tx, byte_stream, decoder) = match resumed {
+        Some((tx, byte_stream)) => (tx, byte_stream, StreamDecoder::new().no_first_cache()),
+        None => {
+            let platform = environment_info.exthost_platform.clone();
+            let arch = environment_info.exthost_arch.clone();
+            let data = match encode_create_params(
+                params,
+                tools,
+                ext_token.now(),
+                model,
+                msg_id,
+                environment_info,
+                current_config.disable_vision,
+                current_config.enable_slow_pool,
+            )
+            .await
+            {
+                Ok(data) => data,
+                Err(e) => {
+                    log_manager::update_log(current_id, LogPatch::Failure(e.to_log_error())).await;
+                    state.decrement_active();
+                    state.increment_error();
+                    return Err(e.into_anthropic_tuple());
+                }
+            };
+
+            let req = build_client_request(AiServiceRequest {
+                ext_token: &ext_token,
+                fs_client_key: None,
+                url: chat_url(use_pri),
+                stream: true,
+                compressed: true,
+                trace_id: new_uuid_v4(),
+                use_pri,
+                cookie: None,
+                exact_length: None,
+                platform,
+                arch,
+            });
+
+            let (tx, response) = match open_bidi_stream(req, data.into()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let e = e.without_url();
+
+                    // 根据错误类型返回不同的状态码
+                    let status_code = if e.is_timeout() {
+                        StatusCode::GATEWAY_TIMEOUT
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    };
+                    crate::debug!("request: {e:?}");
+                    let e = e.to_string();
+
+                    // 更新请求日志为失败
+                    let error = Str::new(&e);
+                    log_manager::update_log(
+                        current_id,
+                        LogPatch::Failure(ErrorInfo::Simple(error)),
+                    )
+                    .await;
+                    state.decrement_active();
+                    state.increment_error();
+
+                    return Err(
+                        ChatError::RequestFailed(status_code, Cow::Owned(e)).into_anthropic_tuple()
+                    );
+                }
+            };
+
+            (tx, response.bytes_stream(), StreamDecoder::new())
         }
     };
+
+    // let platform = environment_info.exthost_platform.clone();
+    // let arch = environment_info.exthost_arch.clone();
+    // let data = match super::adapter::messages::encode_create_params(
+    //     params,
+    //     tools,
+    //     ext_token.now(),
+    //     model,
+    //     msg_id,
+    //     environment_info,
+    //     current_config.disable_vision,
+    //     current_config.enable_slow_pool,
+    // )
+    // .await
+    // {
+    //     Ok(data) => data,
+    //     Err(e) => {
+    //         log_manager::update_log(current_id, LogPatch::Failure(e.to_log_error())).await;
+    //         state.decrement_active();
+    //         state.increment_error();
+    //         return Err(e.into_anthropic_tuple());
+    //     }
+    // };
+    log_manager::update_log(current_id, LogPatch::Success).await;
     let msg_id = MessageId::new(msg_id.as_bytes());
 
     // 构建请求客户端
-    let req = build_client_request(AiServiceRequest {
-        ext_token: &ext_token,
-        fs_client_key: None,
-        url: chat_url(use_pri),
-        stream: true,
-        compressed: true,
-        trace_id: new_uuid_v4(),
-        use_pri,
-        cookie: None,
-        exact_length: Some(data.len()),
-    });
+    // let req = build_client_request(AiServiceRequest {
+    //     ext_token: &ext_token,
+    //     fs_client_key: None,
+    //     url: chat_url(use_pri),
+    //     stream: true,
+    //     compressed: true,
+    //     trace_id: new_uuid_v4(),
+    //     use_pri,
+    //     cookie: None,
+    //     exact_length: Some(data.len()),
+    //     platform,
+    //     arch,
+    // });
     // crate::debug!("request: {req:?}");
     // 发送请求
-    let response = req.body(data).send().await;
+    // let response = req.body(data).send().await;
 
     // 处理请求结果
-    let response = match response {
-        Ok(resp) => {
-            // 更新请求日志为成功
-            log_manager::update_log(current_id, LogUpdate::Success).await;
-            resp
-        }
-        Err(e) => {
-            let e = e.without_url();
+    // let response = match response {
+    //     Ok(resp) => {
+    //         // 更新请求日志为成功
+    //         log_manager::update_log(current_id, LogPatch::Success).await;
+    //         resp
+    //     }
+    //     Err(e) => {
+    //         let e = e.without_url();
 
-            // 根据错误类型返回不同的状态码
-            let status_code = if e.is_timeout() {
-                StatusCode::GATEWAY_TIMEOUT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            crate::debug!("request: {e:?}");
-            let e = e.to_string();
+    //         // 根据错误类型返回不同的状态码
+    //         let status_code = if e.is_timeout() {
+    //             StatusCode::GATEWAY_TIMEOUT
+    //         } else {
+    //             StatusCode::INTERNAL_SERVER_ERROR
+    //         };
+    //         crate::debug!("request: {e:?}");
+    //         let e = e.to_string();
 
-            // 更新请求日志为失败
-            let error = Str::new(&e);
-            log_manager::update_log(current_id, LogUpdate::Failure(ErrorInfo::Simple(error))).await;
-            state.decrement_active();
-            state.increment_error();
+    //         // 更新请求日志为失败
+    //         let error = Str::new(&e);
+    //         log_manager::update_log(current_id, LogPatch::Failure(ErrorInfo::Simple(error))).await;
+    //         state.decrement_active();
+    //         state.increment_error();
 
-            return Err(ChatError::RequestFailed(status_code, Cow::Owned(e)).into_anthropic_tuple());
-        }
-    };
+    //         return Err(ChatError::RequestFailed(status_code, Cow::Owned(e)).into_anthropic_tuple());
+    //     }
+    // };
 
     // 释放活动请求计数
     state.decrement_active();
@@ -1253,9 +1548,10 @@ pub async fn handle_messages(
         });
         let index = Arc::new(AtomicU32::new(0));
         let start_time = std::time::Instant::now();
-        let decoder = Arc::new(Mutex::new(StreamDecoder::new()));
+        let decoder = Arc::new(Mutex::new(decoder));
         let stream_state = Arc::new(Atomic::new(StreamState::NotStarted));
         let last_content_type = Arc::new(Atomic::new(LastContentType::None));
+        let pending_tool_calls = Arc::new(Mutex::new(Vec::new()));
 
         // 定义消息处理器的上下文结构体
         struct MessageProcessContext<'a> {
@@ -1266,6 +1562,7 @@ pub async fn handle_messages(
             stream_state: &'a Atomic<StreamState>,
             last_content_type: &'a Atomic<LastContentType>,
             current_id: u64,
+            pending_tool_calls: &'a Mutex<Vec<PendingToolCall>>,
         }
 
         #[inline]
@@ -1274,7 +1571,7 @@ pub async fn handle_messages(
             vector.extend_from_slice(value.type_name().as_bytes());
             vector.extend_from_slice(b"\ndata: ");
             let vector = {
-                let mut ser = serde_json::Serializer::new(vector);
+                let mut ser = sonic_rs::Serializer::new(vector);
                 __unwrap!(serde::Serialize::serialize(value, &mut ser));
                 ser.into_inner()
             };
@@ -1421,9 +1718,31 @@ pub async fn handle_messages(
                         extend_from_slice(&mut response_data, &event);
                     }
                     StreamMessage::ToolCall(tool_call) => {
+                        // 检查是否需要开始消息
+                        let is_start =
+                            ctx.stream_state.load(Ordering::Acquire) == StreamState::NotStarted;
+                        if is_start {
+                            let event = anthropic::RawMessageStreamEvent::MessageStart {
+                                message: anthropic::Message {
+                                    content: vec![],
+                                    usage: anthropic::Usage::default(),
+                                    id: ctx.msg_id,
+                                    model: ctx.model,
+                                    stop_reason: None,
+                                },
+                            };
+                            extend_from_slice(&mut response_data, &event);
+                        }
+
+                        if tool_call.is_last {
+                            ctx.pending_tool_calls.lock().await.push(PendingToolCall {
+                                id: tool_call.id.clone(),
+                                name: tool_call.name.clone(),
+                            });
+                        }
+
                         // 检查是否需要切换或开始内容块
                         let last_type = ctx.last_content_type.load(Ordering::Acquire);
-
                         if last_type != LastContentType::InputJson {
                             // 如果上次不是InputJson类型，需要结束上个块(如果有的话)
                             if last_type != LastContentType::None {
@@ -1440,20 +1759,16 @@ pub async fn handle_messages(
                                 content_block: anthropic::ContentBlock::ToolUse {
                                     id: tool_call.id,
                                     name: tool_call.name,
-                                    input: indexmap::IndexMap::with_hasher(
-                                        ahash::RandomState::new(),
-                                    ),
+                                    input: sonic_rs::Object::new(),
                                 },
                             };
                             extend_from_slice(&mut response_data, &event);
 
-                            let event = anthropic::RawMessageStreamEvent::ContentBlockDelta {
-                                index: ctx.index.load(Ordering::Acquire),
-                                delta: anthropic::RawContentBlockDelta::InputJsonDelta {
-                                    partial_json: String::new(),
-                                },
-                            };
-                            extend_from_slice(&mut response_data, &event);
+                            // 如果是刚开始，发送ping事件
+                            if is_start {
+                                let event = anthropic::RawMessageStreamEvent::Ping;
+                                extend_from_slice(&mut response_data, &event);
+                            }
 
                             ctx.last_content_type
                                 .store(LastContentType::InputJson, Ordering::Release);
@@ -1468,13 +1783,32 @@ pub async fn handle_messages(
                             },
                         };
                         extend_from_slice(&mut response_data, &event);
+
+                        if tool_call.is_last {
+                            // 计算总时间和首次片段时间
+                            let total_time = ctx.start_time.elapsed().as_secs_f64();
+
+                            log_manager::update_log(ctx.current_id, LogPatch::Timing(total_time))
+                                .await;
+
+                            // 结束当前内容块(如果有的话)
+                            let last_type = ctx.last_content_type.load(Ordering::Acquire);
+                            if last_type != LastContentType::None {
+                                let event = anthropic::RawMessageStreamEvent::ContentBlockStop {
+                                    index: ctx.index.load(Ordering::Acquire),
+                                };
+                                extend_from_slice(&mut response_data, &event);
+                            }
+
+                            ctx.stream_state.store(StreamState::Completed, Ordering::Release);
+                            break;
+                        }
                     }
                     StreamMessage::StreamEnd => {
                         // 计算总时间和首次片段时间
                         let total_time = ctx.start_time.elapsed().as_secs_f64();
 
-                        log_manager::update_log(ctx.current_id, LogUpdate::Timing(total_time))
-                            .await;
+                        log_manager::update_log(ctx.current_id, LogPatch::Timing(total_time)).await;
 
                         // 结束当前内容块(如果有的话)
                         let last_type = ctx.last_content_type.load(Ordering::Acquire);
@@ -1513,7 +1847,7 @@ pub async fn handle_messages(
         }
 
         // 首先处理stream直到获得第一个结果
-        let (mut stream, drop_handle) = DroppableStream::new(response.bytes_stream());
+        let (mut stream, drop_handle) = DroppableStream::new(byte_stream);
         {
             let mut decoder = decoder.lock().await;
             while !decoder.is_first_result_ready() {
@@ -1526,7 +1860,7 @@ pub async fn handle_messages(
                             // 更新请求日志为失败
                             log_manager::update_log(
                                 current_id,
-                                LogUpdate::Failure2(
+                                LogPatch::FailureTimed(
                                     canonical.to_error_info(),
                                     start_time.elapsed().as_secs_f64(),
                                 ),
@@ -1550,7 +1884,7 @@ pub async fn handle_messages(
                         // 更新请求日志为失败
                         log_manager::update_log(
                             current_id,
-                            LogUpdate::Failure(ErrorInfo::Simple(Str::from_static(
+                            LogPatch::Failure(ErrorInfo::Simple(Str::from_static(
                                 ERR_STREAM_RESPONSE,
                             ))),
                         )
@@ -1567,6 +1901,8 @@ pub async fn handle_messages(
         }
 
         let decoder_clone = decoder.clone();
+        let drop_handle_clone = drop_handle.clone();
+        let pending_tool_calls_clone = pending_tool_calls.clone();
 
         // 处理后续的stream
         let stream = stream
@@ -1576,7 +1912,8 @@ pub async fn handle_messages(
                 let index = index.clone();
                 let stream_state = stream_state.clone();
                 let last_content_type = last_content_type.clone();
-                let drop_handle = drop_handle.clone();
+                let drop_handle = drop_handle_clone.clone();
+                let pending_tool_calls = pending_tool_calls_clone.clone();
 
                 async move {
                     let chunk = match chunk {
@@ -1595,6 +1932,7 @@ pub async fn handle_messages(
                         stream_state: &stream_state,
                         last_content_type: &last_content_type,
                         current_id,
+                        pending_tool_calls: &pending_tool_calls,
                     };
 
                     // 使用decoder处理chunk
@@ -1651,15 +1989,30 @@ pub async fn handle_messages(
                 let content_delays = decoder_guard.take_content_delays();
                 let thinking_content = decoder_guard.take_thinking_content();
 
-                log_manager::update_log(current_id, LogUpdate::Delays(content_delays, thinking_content))
+                log_manager::update_log(current_id, LogPatch::Delays(content_delays, thinking_content))
                     .await;
+
+                let mut pending_tool_calls = pending_tool_calls.lock().await;
+                if !pending_tool_calls.is_empty() {
+                    let pending = core::mem::take(&mut *pending_tool_calls);
+                    let mut ids = pending.iter().map(|p| p.id.as_ref()).collect::<Vec<_>>();
+                    let key = session_key(&mut ids);
+                    drop(ids);
+                    if let Some(byte_stream) = drop_handle.take_stream() {
+                        SESSION_CACHE.get().park(key, BidiSession {
+                            upstream_tx: tx,
+                            byte_stream,
+                            pending_tool_calls: pending,
+                        });
+                    }
+                }
 
                 // 处理使用量统计
                 let usage = if *REAL_USAGE {
                     let usage =
                         get_token_usage(ext_token, use_pri, request_time, model.id).await;
                     if let Some(usage) = usage {
-                        log_manager::update_log(current_id, LogUpdate::Usage(usage))
+                        log_manager::update_log(current_id, LogPatch::Usage(usage))
                             .await;
                     }
                     usage.map(ChainUsage::into_anthropic_delta)
@@ -1699,9 +2052,12 @@ pub async fn handle_messages(
     } else {
         // 非流式响应
         let start_time = std::time::Instant::now();
-        let mut decoder = StreamDecoder::new().no_first_cache();
+        let mut decoder = decoder.no_first_cache();
         let mut content = Vec::with_capacity(16);
-        let mut stream = response.bytes_stream();
+        let mut input_json = String::with_capacity(64);
+        let mut pending_tool_calls = Vec::new();
+        let mut stream = byte_stream;
+        let mut tool_call_finished = false;
         // let mut prompt = Prompt::None;
 
         // 逐个处理chunks
@@ -1717,7 +2073,6 @@ pub async fn handle_messages(
             // 立即处理当前chunk
             match decoder.decode(&chunk, convert_web_ref) {
                 Ok(messages) => {
-                    let mut input_json = String::with_capacity(64);
                     for message in messages {
                         match message {
                             StreamMessage::Thinking(thinking) => match thinking {
@@ -1771,15 +2126,22 @@ pub async fn handle_messages(
                             }
                             StreamMessage::ToolCall(tool_call) => {
                                 input_json.push_str(&tool_call.input);
-                                if tool_call.is_last
-                                    && let Ok(input) = serde_json::from_str(&input_json)
-                                {
-                                    content.push(anthropic::ContentBlock::ToolUse {
+                                if tool_call.is_last {
+                                    if let Ok(input) = sonic_rs::from_str(&input_json) {
+                                        content.push(anthropic::ContentBlock::ToolUse {
+                                            id: tool_call.id.clone(),
+                                            name: tool_call.name.clone(),
+                                            input,
+                                        });
+                                    } else {
+                                        crate::debug!("tool call JSON parse failed: {input_json}");
+                                    }
+                                    input_json.clear();
+                                    pending_tool_calls.push(PendingToolCall {
                                         id: tool_call.id,
                                         name: tool_call.name,
-                                        input,
                                     });
-                                    input_json.clear();
+                                    tool_call_finished = true;
                                 }
                             }
                             // StreamMessage::Debug(debug_prompt) => {
@@ -1798,7 +2160,7 @@ pub async fn handle_messages(
                     let canonical = error.canonical();
                     log_manager::update_log(
                         current_id,
-                        LogUpdate::Failure(canonical.to_error_info()),
+                        LogPatch::Failure(canonical.to_error_info()),
                     )
                     .await;
                     state.increment_error();
@@ -1817,9 +2179,21 @@ pub async fn handle_messages(
                     }
                 }
             }
+
+            if tool_call_finished {
+                break;
+            }
         }
 
-        drop(stream);
+        if !pending_tool_calls.is_empty() {
+            let mut ids = pending_tool_calls.iter().map(|p| p.id.as_ref()).collect::<Vec<_>>();
+            let key = session_key(&mut ids);
+            drop(ids);
+            SESSION_CACHE.get().park(
+                key,
+                BidiSession { upstream_tx: tx, byte_stream: stream, pending_tool_calls },
+            );
+        }
 
         let (chain_usage, anthropic_usage) = if *REAL_USAGE {
             let usage = get_token_usage(ext_token, use_pri, request_time, model.id).await;
@@ -1854,7 +2228,7 @@ pub async fn handle_messages(
 
         log_manager::update_log(
             current_id,
-            LogUpdate::TimingChain(
+            LogPatch::TimingChain(
                 total_time,
                 Chain { delays: content_delays, usage: chain_usage, think: thinking_content },
             ),
@@ -1865,7 +2239,7 @@ pub async fn handle_messages(
             tokio::spawn(usage_check);
         }
 
-        let data = __unwrap!(serde_json::to_vec(&response_data));
+        let data = __unwrap!(sonic_rs::to_vec(&response_data));
         Ok(__unwrap!(
             Response::builder()
                 .header(CACHE_CONTROL, NO_CACHE_REVALIDATE)
@@ -1903,7 +2277,9 @@ pub async fn handle_messages_count_tokens(
 
     // 将消息转换为hex格式
     let msg_id = uuid::Uuid::new_v4();
-    let (data, compressed) = match super::adapter::anthropic::non_stream::encode_create_params(
+    let platform = environment_info.exthost_platform.clone();
+    let arch = environment_info.exthost_arch.clone();
+    let (data, compressed) = match super::adapter::messages::non_stream::encode_create_params(
         params,
         tools,
         ext_token.now(),
@@ -1930,6 +2306,8 @@ pub async fn handle_messages_count_tokens(
         use_pri,
         cookie: None,
         exact_length: Some(data.len()),
+        platform,
+        arch,
     });
     // crate::debug!("request: {req:?}");
     // 请求
@@ -1983,7 +2361,7 @@ pub async fn handle_messages_count_tokens(
         },
     };
 
-    let data = __unwrap!(serde_json::to_vec(&response_data));
+    let data = __unwrap!(sonic_rs::to_vec(&response_data));
     Ok(__unwrap!(
         Response::builder()
             .header(CACHE_CONTROL, NO_CACHE_REVALIDATE)

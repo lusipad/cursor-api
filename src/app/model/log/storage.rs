@@ -3,7 +3,7 @@ use alloc::collections::VecDeque;
 
 type HashMap<K, V> = hashbrown::HashMap<K, V, ahash::RandomState>;
 
-pub struct AssociatedToken {
+pub struct TokenEntry {
     // pub user: Option<UserProfile>,
     pub token: ExtToken,
     pub ref_count: usize,
@@ -11,7 +11,7 @@ pub struct AssociatedToken {
 }
 
 pub type MainStorage = VecDeque<RequestLog>;
-pub type AssociatedStorage = HashMap<TokenKey, AssociatedToken>;
+pub type TokenStore = HashMap<TokenKey, TokenEntry>;
 // pub type SecondaryStorage = HashMap<TokenKey, ExtToken>;
 
 // pub type IndexStorage = Vec<(usize, Hash)>;

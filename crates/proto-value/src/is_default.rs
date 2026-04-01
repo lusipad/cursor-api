@@ -2,53 +2,19 @@ pub const trait IsDefault: Sized {
     fn is_default(&self) -> bool;
 }
 
-impl const IsDefault for bool {
-    #[inline(always)]
-    fn is_default(&self) -> bool {
-        !*self
-    }
+macro_rules! impl_is_default_prim {
+    ($($ty:ty : $zero:expr),* $(,)?) => {$(
+        impl const IsDefault for $ty {
+            #[inline(always)]
+            fn is_default(&self) -> bool { *self == $zero }
+        }
+    )*};
 }
 
-impl const IsDefault for i32 {
-    #[inline(always)]
-    fn is_default(&self) -> bool {
-        *self == 0
-    }
-}
-
-impl const IsDefault for i64 {
-    #[inline(always)]
-    fn is_default(&self) -> bool {
-        *self == 0
-    }
-}
-
-impl const IsDefault for u32 {
-    #[inline(always)]
-    fn is_default(&self) -> bool {
-        *self == 0
-    }
-}
-
-impl const IsDefault for u64 {
-    #[inline(always)]
-    fn is_default(&self) -> bool {
-        *self == 0
-    }
-}
-
-impl const IsDefault for f32 {
-    #[inline(always)]
-    fn is_default(&self) -> bool {
-        *self == 0.0
-    }
-}
-
-impl const IsDefault for f64 {
-    #[inline(always)]
-    fn is_default(&self) -> bool {
-        *self == 0.0
-    }
+impl_is_default_prim! {
+    bool: false,
+    i32: 0, i64: 0, u32: 0, u64: 0,
+    f32: 0.0, f64: 0.0,
 }
 
 #[cfg(feature = "alloc")]
@@ -90,20 +56,9 @@ impl<T> const IsDefault for crate::Enum<T> {
     }
 }
 
-#[cfg(feature = "bytes")]
-impl const IsDefault for crate::Bytes<::bytes::Bytes> {
+impl<B: [const] IsDefault> const IsDefault for crate::Bytes<B> {
     #[inline(always)]
-    fn is_default(&self) -> bool {
-        self.0.is_default()
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl const IsDefault for crate::Bytes<::alloc::vec::Vec<u8>> {
-    #[inline(always)]
-    fn is_default(&self) -> bool {
-        self.0.is_default()
-    }
+    fn is_default(&self) -> bool { self.0.is_default() }
 }
 
 impl<T> const IsDefault for ::core::option::Option<T> {

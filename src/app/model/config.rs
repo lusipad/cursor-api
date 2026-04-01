@@ -80,6 +80,7 @@ impl AppConfig {
             crate::core::model::init_resolver();
             super::token::parse_providers();
             super::context_fill_mode::init();
+            crate::core::stream::session::SessionCache::init();
         }
         crate::core::constant::create_models();
 
